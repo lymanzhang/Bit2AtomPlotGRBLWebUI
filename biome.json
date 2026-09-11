@@ -1,0 +1,69 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.0/schema.json",
+  "files": {
+    "includes": ["**", "!src/__tests__/fixtures/**"]
+  },
+  "formatter": {
+    "indentStyle": "space",
+    "lineWidth": 120
+  },
+  "css": {
+    "formatter": {
+      "enabled": false
+    }
+  },
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+      "a11y": {
+        "noSvgWithoutTitle": "off"
+      },
+      "correctness": {
+        "noUnusedImports": "off",
+        "noSwitchDeclarations": "off",
+        "noUndeclaredVariables": "off"
+      },
+      "style": {
+        "noNamespace": "error",
+        "useNumberNamespace": "off",
+        "noParameterAssign": "error",
+        "useAsConstAssertion": "error",
+        "useDefaultParameterLast": "error",
+        "useEnumInitializers": "error",
+        "useSelfClosingElements": "error",
+        "useSingleVarDeclarator": "error",
+        "noUnusedTemplateLiteral": "off",
+        "noInferrableTypes": "off",
+        "noUselessElse": "error",
+        "useTemplate": "off",
+        "useImportType": "off",
+        "noNonNullAssertion": "off"
+      },
+      "security": {
+        "noBlankTarget": "error"
+      },
+      "suspicious": {
+        "noExplicitAny": "off",
+        "noConfusingVoidType": "off",
+        "noEmptyBlock": "off"
+      },
+      "complexity": {
+        "noImportantStyles": "off",
+        "useDateNow": "off",
+        "noUselessSwitchCase": "off"
+      }
+    }
+  },
+  "overrides": [],
+  "vcs": {
+    "enabled": false
+  }
+}

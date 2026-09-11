@@ -1,0 +1,24 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300">
+  <!-- 底层：5条水平线，会被圆遮挡 -->
+  <g stroke="#000" stroke-width="0.5" fill="none">
+    <line x1="20" y1="60" x2="380" y2="60" />
+    <line x1="20" y1="100" x2="380" y2="100" />
+    <line x1="20" y1="140" x2="380" y2="140" />
+    <line x1="20" y1="180" x2="380" y2="180" />
+    <line x1="20" y1="220" x2="380" y2="220" />
+  </g>
+  <!-- 底层：5条竖线 -->
+  <g stroke="#000" stroke-width="0.5" fill="none">
+    <line x1="60" y1="20" x2="60" y2="280" />
+    <line x1="120" y1="20" x2="120" y2="280" />
+    <line x1="180" y1="20" x2="180" y2="280" />
+    <line x1="240" y1="20" x2="240" y2="280" />
+    <line x1="300" y1="20" x2="300" y2="280" />
+  </g>
+  <!-- 上层：填充圆，遮挡下方的线条 -->
+  <circle cx="200" cy="150" r="80" fill="#ccc" stroke="none" />
+  <!-- 圆内文字 -->
+  <text x="200" y="145" text-anchor="middle" font-size="16" fill="#666">被填充圆形</text>
+  <text x="200" y="165" text-anchor="middle" font-size="16" fill="#666">遮挡的区域</text>
+</svg>

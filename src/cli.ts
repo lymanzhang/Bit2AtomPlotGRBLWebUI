@@ -1,0 +1,291 @@
+/**
+ * Starting point for the server app (Command Line Interface).
+ * Execute also one-off instructions on the device.
+ */
+import { readFileSync } from "node:fs";
+import { flattenSVG } from "flatten-svg";
+import { Window } from "svgdom";
+import yargs from "yargs";
+import { hideBin } from "yargs/helpers";
+import type { Hardware } from "./ebb.js";
+import { replan } from "./massager.js";
+import { PaperSize } from "./paper-size.js";
+import { defaultPlanOptions, getDevice, type PlanOptions } from "./planning.js";
+import { connectEBB, startServer } from "./server.js";
+import { formatDuration, mmPerSvgUnitFromSvg } from "./util.js";
+
+function parseSvg(svg: string) {
+  const window = new Window();
+  window.document.documentElement.innerHTML = svg;
+  return window.document.documentElement;
+}
+
+/**
+ * Process command arguments.
+ * @param argv
+ */
+export function cli(argv: string[]): void {
+  yargs(hideBin(process.argv))
+    .strict()
+    .option("hardware", {
+      describe: "select hardware type",
+      choices: ["v3", "brushless", "nextdraw-2234", "idraw-h-se", "custom"] as const,
+      default: "v3",
+      coerce: (value) => value as Hardware,
+    })
+    .option("device", {
+      alias: "d",
+      describe: "device to connect to",
+      type: "string",
+    })
+    .command(
+      "plot <file>",
+      "plot an svg, then exit",
+      (yargs) =>
+        yargs
+          .positional("file", {
+            type: "string",
+            description: "File to plot",
+            demandOption: true,
+          })
+          .option("paper-size", {
+            alias: "s",
+            describe: "Paper size to use",
+            coerce: (value) => {
+              if (Object.hasOwn(PaperSize.standard, value)) {
+                return PaperSize.standard[value];
+              }
+              const m = /^([0-9]*(?:\.[0-9]+)?)\s*x\s*([0-9]*(?:\.[0-9]+)?)\s*(cm|mm|in)$/i.exec(String(value).trim());
+              if (m) {
+                return new PaperSize({ x: Number(m[1]), y: Number(m[2]) });
+              }
+              throw new Error(
+                `Paper size should be a standard size (${Object.keys(PaperSize.standard).join(", ")}) or a custom size such as "100x100mm" or "16x10in"`,
+              );
+            },
+            demandOption: true,
+          })
+          .option("landscape", {
+            type: "boolean",
+            description: "Place the long side of the paper on the x-axis",
+          })
+          .option("portrait", {
+            type: "boolean",
+            description: "Place the short side of the paper on the x-axis",
+          })
+          .option("margin", {
+            describe: "Margin (in mm)",
+            type: "number",
+            default: defaultPlanOptions.marginMm,
+          })
+          .option("pen-down-height", {
+            describe: "Pen down height (%)",
+            type: "number",
+            default: defaultPlanOptions.penDownHeight,
+          })
+          .option("pen-up-height", {
+            describe: "Pen up height (%)",
+            type: "number",
+            default: defaultPlanOptions.penUpHeight,
+          })
+          .option("pen-down-acceleration", {
+            describe: "Acceleration when the pen is down (in mm/s^2)",
+            type: "number",
+            default: defaultPlanOptions.penDownAcceleration,
+          })
+          .option("pen-down-max-velocity", {
+            describe: "Maximum velocity when the pen is down (in mm/s)",
+            type: "number",
+            default: defaultPlanOptions.penDownMaxVelocity,
+          })
+          .option("pen-down-cornering-factor", {
+            describe: "Cornering factor when the pen is down",
+            type: "number",
+            default: defaultPlanOptions.penDownCorneringFactor,
+          })
+          .option("pen-up-acceleration", {
+            describe: "Acceleration when the pen is up (in mm/s^2)",
+            type: "number",
+            default: defaultPlanOptions.penUpAcceleration,
+          })
+          .option("pen-up-max-velocity", {
+            describe: "Maximum velocity when the pen is up (in mm/s)",
+            type: "number",
+            default: defaultPlanOptions.penUpMaxVelocity,
+          })
+          .option("pen-drop-duration", {
+            describe: "How long the pen takes to drop (in seconds)",
+            type: "number",
+            default: defaultPlanOptions.penDropDuration,
+          })
+          .option("pen-lift-duration", {
+            describe: "How long the pen takes to lift (in seconds)",
+            type: "number",
+            default: defaultPlanOptions.penLiftDuration,
+          })
+          .option("sort-paths", {
+            describe: "Re-order paths to minimize pen-up travel time",
+            type: "boolean",
+            default: true,
+          })
+          .option("fit-page", {
+            describe: "Re-scale and position the image to fit on the page",
+            type: "boolean",
+            default: true,
+          })
+          .option("scale-percent", {
+            describe:
+              "Custom scale percentage (used when fit-page is disabled and scale differs from 100, e.g. 50 = half size)",
+            type: "number",
+            default: 100,
+          })
+          .option("crop-to-margins", {
+            describe: "Remove lines that fall outside the margins",
+            type: "boolean",
+            default: true,
+          })
+          .option("minimum-path-length", {
+            describe: "Remove paths that are shorter than this length (in mm)",
+            type: "number",
+            default: defaultPlanOptions.minimumPathLength,
+          })
+          .option("point-join-radius", {
+            describe: "Point-joining radius (in mm)",
+            type: "number",
+            default: defaultPlanOptions.pointJoinRadius,
+          })
+          .option("path-join-radius", {
+            describe: "Path-joining radius (in mm)",
+            type: "number",
+            default: defaultPlanOptions.pathJoinRadius,
+          })
+          .option("rotate-drawing", {
+            describe: "Rotate drawing (in degrees)",
+            type: "number",
+            default: defaultPlanOptions.rotateDrawing,
+          })
+          .check((args) => {
+            if (args.landscape && args.portrait) {
+              throw new Error("Only one of --portrait and --landscape may be specified");
+            }
+            return true;
+          }),
+      async (args) => {
+        console.log("reading svg...");
+        const svg = readFileSync(args.file, "utf8");
+        console.log("parsing svg...");
+        const parsed = parseSvg(svg);
+        console.log("flattening svg...");
+        const lines = flattenSVG(parsed, {});
+        console.log("generating motion plan...");
+        const paperSize = args.landscape
+          ? args["paper-size"].landscape
+          : args.portrait
+            ? args["paper-size"].portrait
+            : args["paper-size"];
+        const planOptions: PlanOptions = {
+          driveParams: defaultPlanOptions.driveParams,
+          paperSize,
+          marginMm: args.margin,
+          hardware: args.hardware,
+          penHome: { x: 0, y: 0 },
+
+          selectedGroupLayers: new Set([]), // TODO
+          selectedStrokeLayers: new Set([]), // TODO
+          layerMode: "all", // TODO
+
+          penUpHeight: args["pen-up-height"],
+          penDownHeight: args["pen-down-height"],
+
+          penDownAcceleration: args["pen-down-acceleration"],
+          penDownMaxVelocity: args["pen-down-max-velocity"],
+          penDownCorneringFactor: args["pen-down-cornering-factor"],
+          penUpAcceleration: args["pen-up-acceleration"],
+          penUpMaxVelocity: args["pen-up-max-velocity"],
+
+          penDropDuration: args["pen-drop-duration"],
+          penLiftDuration: args["pen-lift-duration"],
+
+          sortPaths: args["sort-paths"],
+          // fit-page 开启 → 等比缩放到纸张；关闭后 scale-percent ≠ 100 走自定义缩放，否则 1:1 原尺寸
+          scaleMode:
+            args["scale-percent"] !== 100 ? "custom" : args["fit-page"] ? "fit" : "actual",
+          scalePercent: args["scale-percent"],
+          cropToMargins: args["crop-to-margins"],
+          rotateDrawing: args["rotate-drawing"],
+          placement: defaultPlanOptions.placement,
+          // width 带绝对物理单位（或 px 数与 viewBox 不一致）时按其还原真实
+          // 尺寸；width="100%"/缺失时 undefined → 回退 96dpi 缺省
+          mmPerSvgUnit: mmPerSvgUnitFromSvg(parsed),
+
+          minimumPathLength: args["minimum-path-length"],
+          pathJoinRadius: args["path-join-radius"],
+          pointJoinRadius: args["point-join-radius"],
+          hiding: false,
+        };
+        const p = replan(lines, planOptions);
+        console.log(`${p.motions.length} motions, estimated duration: ${formatDuration(p.duration())}`);
+        console.log("connecting to plotter...");
+        const ebb = await connectEBB(args.hardware, args.device);
+        if (!ebb) {
+          console.error("Couldn't connect to device!");
+          process.exit(1);
+        }
+        console.log("plotting...");
+        const startTime = Date.now();
+        await ebb.executePlan(p);
+        console.log(`done! took ${formatDuration((Date.now() - startTime) / 1000)}`);
+        await ebb.close();
+      },
+    )
+    .command(
+      "pen [percent]",
+      "put the pen to [percent]",
+      (yargs) =>
+        yargs
+          .positional("percent", {
+            type: "number",
+            description: "percent height between 0 and 100",
+            demandOption: true,
+          })
+          .check((args) => args.percent >= 0 && args.percent <= 100),
+      async (args) => {
+        console.log("connecting to plotter...");
+        const ebb = await connectEBB(args.hardware, args.device);
+        if (!ebb) {
+          console.error("Couldn't connect to device!");
+          process.exit(1);
+        }
+        const device = getDevice(ebb.hardware);
+        await ebb.setPenHeight(device.penPctToPos(args.percent), 1000);
+
+        console.log(`moving to ${args.percent}%...`);
+        await ebb.close();
+      },
+    )
+    .command(
+      "$0",
+      "run the Bit2AtomBot web server",
+      (args) =>
+        args
+          .option("port", {
+            alias: "p",
+            describe: "TCP port on which to listen",
+            default: 9080,
+            type: "number",
+          })
+          .option("enable-cors", {
+            describe: "enable cross-origin resource sharing (CORS)",
+            default: false,
+            type: "boolean",
+          })
+          .option("max-payload-size", {
+            describe: "maximum payload size to accept",
+            default: "200mb",
+          }),
+      (args) => {
+        startServer(args.port, args.hardware, args.device, args["enable-cors"], args["max-payload-size"]);
+      },
+    )
+    .parse(argv);
+}

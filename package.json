@@ -1,0 +1,93 @@
+{
+  "name": "bit2atomplotgrbl",
+  "version": "0.1.0",
+  "description": "Bit2AtomPlotGRBL - Web UI for GRBL-based pen plotters (Z-axis pen lift)",
+  "homepage": "",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "bugs": "",
+  "keywords": [
+    "grbl",
+    "plotter",
+    "pen plotter",
+    "gcode",
+    "serial",
+    "hardware",
+    "robot"
+  ],
+  "main": "index.mjs",
+  "bin": {
+    "bit2atomplotgrbl": "cli.mjs"
+  },
+  "scripts": {
+    "lint": "biome lint src",
+    "build": "npm run build:server && npm run build:ui",
+    "build:server": "tsc --project tsconfig.server.json",
+    "build:ui": "node --experimental-modules build.mjs",
+    "prepare": "rimraf dist && npm run build",
+    "start": "npm run build && node cli.mjs",
+    "start-webserial": "cross-env IS_WEB=1 BIT2ATOM_HOT_RELOAD=1 npm run build:ui",
+    "deploy": "rimraf dist/ui && cross-env IS_WEB=1 npm run build:ui && gh-pages --dist dist/ui",
+    "test": "vitest run"
+  },
+  "author": "Jeremy Rose <nornagon@nornagon.net>",
+  "license": "AGPL-3.0-only",
+  "devDependencies": {
+    "@biomejs/biome": "2.5.0",
+    "@craftamap/esbuild-plugin-html": "^0.9.0",
+    "@serialport/bindings-cpp": "^13.0.0",
+    "@types/cors": "^2.8.4",
+    "@types/express": "^5.0.0",
+    "@types/node": "^24.3.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/supertest": "^7.0.0",
+    "@types/w3c-web-serial": "^1.0.8",
+    "@types/ws": "8.18",
+    "@types/yargs": "^17.0.0",
+    "cross-env": "^10.0.0",
+    "esbuild": "^0.28.0",
+    "esbuild-plugin-inline-worker": "^0.1.1",
+    "gh-pages": "^6.0.0",
+    "rimraf": "^5.0.0 || ^6.0.0",
+    "semver": "^7.5.2",
+    "supertest": "^7.0.0",
+    "typescript": "^5.0",
+    "vitest": "^4.0.0"
+  },
+  "dependencies": {
+    "color-interpolate": "^2.0.0",
+    "colormap": "^2.3.2",
+    "cors": "^2.8.5",
+    "express": "^5.0.1",
+    "flatten-svg": "^0.3.0",
+    "optimize-paths": "^1.2.2",
+    "polygon-clipping": "^0.15.7",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "serialport": "^13.0.0",
+    "svgdom": "0.1.23",
+    "ws": "^8.0.0",
+    "yargs": "^18.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "type": "module",
+  "files": [
+    "/dist",
+    "cli.mjs"
+  ],
+  "optionalDependencies": {
+    "@esbuild/linux-arm": "^0.28.0",
+    "wake-lock": "^0.2.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "esbuild@0.27.7": true,
+    "wake-lock@0.2.0": true,
+    "@serialport/bindings-cpp@13.0.0": true
+  }
+}
