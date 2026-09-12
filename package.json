@@ -2,12 +2,12 @@
   "name": "bit2atomplotgrbl",
   "version": "0.1.0",
   "description": "Bit2AtomPlotGRBL - Web UI for GRBL-based pen plotters (Z-axis pen lift)",
-  "homepage": "",
+  "homepage": "https://github.com/lymanzhang/Bit2AtomPlotGRBLWebUI#readme",
   "repository": {
     "type": "git",
-    "url": ""
+    "url": "git+https://github.com/lymanzhang/Bit2AtomPlotGRBLWebUI.git"
   },
-  "bugs": "",
+  "bugs": "https://github.com/lymanzhang/Bit2AtomPlotGRBLWebUI/issues",
   "keywords": [
     "grbl",
     "plotter",
