@@ -14,18 +14,19 @@ function svgEl(attrs: Record<string, string>) {
   return { getAttribute: (n: string) => attrs[n] ?? null };
 }
 
-/** 累计落笔状态下的 XYMotion 距离（mm） */
+/** 累计落笔状态下的 XYMotion 距离（mm，Plan 坐标毫米口径直读；penPct 口径：
+ * finalPos > initialPos = 落笔） */
 function penDownDistance(plan: Plan): number {
-  let totalSteps = 0;
+  let total = 0;
   let penDown = false;
   for (const m of plan.motions) {
     if (m instanceof PenMotion) {
-      penDown = m.finalPos < m.initialPos;
+      penDown = m.finalPos > m.initialPos;
     } else if (m instanceof XYMotion && penDown) {
-      for (const b of m.blocks) totalSteps += b.distance;
+      for (const b of m.blocks) total += b.distance;
     }
   }
-  return totalSteps / 5; // v3 stepsPerMm
+  return total;
 }
 
 describe("mmPerSvgUnitFromSvg", () => {

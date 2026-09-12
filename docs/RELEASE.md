@@ -55,8 +55,8 @@ git push origin v<版本>
 # 版本说明写入临时文件后：
 $cred = "url=https://github.com`n`n" | git credential fill | Out-String | ConvertFrom-StringData
 $env:GH_TOKEN = $cred.password
-gh release create v<版本> "_release\bit2atombot-<版本>-src.zip" `
-    --title "Bit2AtomBot v<版本>" --notes-file <说明文件路径>
+gh release create v<版本> "_release\bit2atomplotgrbl-<版本>-src.zip" `
+    --title "Bit2AtomPlotGRBL v<版本>" --notes-file <说明文件路径>
 Remove-Item Env:\GH_TOKEN
 ```
 
@@ -71,37 +71,10 @@ Remove-Item Env:\GH_TOKEN
 
 ## 发布记录
 
-### v0.20.0（2026-09-08）
+### v0.1.0（待发布）
 
-- **版本**：0.19.0 → 0.20.0（缩放三态/SVG 尺寸检测/防撞轴收尾 + 裁剪误删与加载卡死修复，升 minor），`node tools/release.mjs --level minor`
-- **流程修正**：release.mjs 只提交 package.json/package-lock.json——功能改动必须先手动提交再跑它，tag 才包含全部内容（本次先提交 acac7c8，再 bump f5543f2）
-- **tag 重指向**：tag 推送前的补充提交（维护注释 6e4418e、README 措辞 a6a26d0、更新日志补回 5ff710e）用 `git tag -f v0.20.0` 重锚定，保证 tag 快照为定稿内容
-- **IDE 旧缓冲区覆盖（已两次踩坑）**：IDE 中打开着旧版本文件时，外部工具对其的编辑会被 IDE 缓冲区在保存时整体覆盖——本版先丢了 `ui.tsx` 的 handleFile 解构（导致加载卡死 bug 差点进 tag），后又丢了 README 更新日志 v0.20.0 条目。防范：批量编辑前提醒关闭相关文件的 IDE 标签页；提交前对关键文档 `git grep` 目标标记复核（如 `v0.20.0`、`scaleMode`），不能只看 `git status` 的 M 标记
-- **打包坑**：PowerShell 5.1 管道 `git archive | tar -xf` 会损坏二进制流（报 Damaged tar archive），须 `git archive --output=xxx.tar` 先落盘再解包
-- **包结构**：git archive（tag 跟踪文件 64 个）+ dist/ 预构建产物，共 100 条目、1.38 MB；.NET ZipArchive 打包，0 反斜杠条目
-- **验证**：从 GitHub 克隆 v0.20.0 tag → `npm ci` → `npm run build` → 53 测试通过 → `node cli.mjs --port 9099` 冒烟 HTTP 200
-- **产物**：tag `v0.20.0`、Release 附件 `bit2atombot-0.20.0-src.zip`，说明渲染与附件验证通过
-
-### v0.19.0（2026-09-08）
-
-- **版本**：0.18.0 → 0.19.0（新增任务日志/排版设置 + 多项长时绘制可靠性修复，升 minor）
-- **release.mjs 的坑**：该工具会**自动** `inc` 版本 + commit + 打 tag——先手动 `npm version` 再跑它会导致版本连升两级（本次 0.19.0 → 0.20.0）。修正：版本文件手动改回目标值后，bump 提交变为空提交、`--amend` 会被 git 拒绝，需 `git reset HEAD^` 丢弃 bump 提交后重打 tag（注意先删掉误打的 tag）
-- **包结构**：git archive（tag 内容 61 个跟踪文件）+ `dist/` 预构建产物（36 个文件），共 97 条目、1.37 MB；`git archive` + `tar -xf` 解包到暂存目录，再用 .NET ZipArchive 打包
-- **credential 新坑**：本机安全策略禁止 `cmd /c`，`Start-Process -RedirectStandardInput` 喂 `git credential fill` 报 `missing protocol field`（PS 5.1 重定向编码问题）；**node `spawnSync` 的 `input` 选项是二进制安全的可靠替代**：
-  ```powershell
-  $r = node -e "const {spawnSync}=require('child_process'); const res=spawnSync('git',['credential','fill'],{input:'protocol=https\nhost=github.com\n\n',encoding:'utf8'}); process.stdout.write(res.stdout||'')" | Out-String
-  $env:GH_TOKEN = ($r | ConvertFrom-StringData).password
-  ```
-- **产物**：tag `v0.19.0`、Release 附件 `bit2atombot-0.19.0-src.zip`，说明渲染与附件验证通过
-
-### v0.18.0（2026-09-07）
-
-- **版本**：0.17.2 → 0.18.0（含新功能「运行日志落盘」，按 semver 升 minor），`npm version minor --no-git-tag-version` 同步 package.json + package-lock.json
-- **分叉调和**：发布前本地与远端 main 各有 1 个不同提交，`git pull --rebase` 无冲突解决后再提交/打 tag
-- **包结构演进**：`install.bat` / `install.sh` / `start.bat` / `start.sh` 已在 0.17.2 后从仓库移除，打包清单以 `git ls-tree HEAD --name-only` 为准（本次 85 条目、661.9 KB）
-- **fixture 收编**：复合路径回归测试原引用仓库外 SVG，已收进 `src/__tests__/fixtures/` 并用 `new URL("./fixtures/…", import.meta.url)` 引用，保证包内测试可独立运行
-- **credential 坑**：PowerShell 5.1 管道喂 `git credential fill` 报 `missing host/protocol field`（详见注意事项 3）
-- **产物**：tag `v0.18.0`、Release 附件 `bit2atombot-0.18.0-src.zip`，说明渲染与附件均验证通过
+- 首个 GRBL 移植版发布（EBB 版 v0.20.0 基线），版本历程见姊妹项目 Bit2AtomPlotWebUI 的发布记录
+- 发布前核对清单：package.json 版本号、CHANGELOG.md 小节、tag、发布包三者一致；包内测试可独立运行（`npm ci` → `npm test`）
 
 ## 注意事项（各版本踩过的坑）
 

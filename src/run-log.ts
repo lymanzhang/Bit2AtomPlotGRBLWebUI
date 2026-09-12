@@ -12,7 +12,7 @@ import { inspect } from "node:util";
 //   BIT2ATOM_NO_FILE_LOG=1  禁用文件日志（仅终端输出）
 //   BIT2ATOM_LOG_DIR=<dir>  日志目录（默认 logs/）
 const MAX_LOG_FILES = 50; // 保留最近 N 个运行日志，避免无限增长
-const LOG_PREFIX = "bit2atombot-";
+const LOG_PREFIX = "bit2atomplotgrbl-";
 
 export function startRunLog(): void {
   if (process.env.BIT2ATOM_NO_FILE_LOG) return;

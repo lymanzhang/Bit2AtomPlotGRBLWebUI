@@ -5,15 +5,59 @@ import { type Vec2, vadd, vdot, vlen, vmul, vnorm, vsub } from "./vec.js";
 
 const epsilon = 1e-9;
 
+/** Z 轴传动形式：丝杆（导程）或同步带（齿数×齿距） */
+export type ZDriveType = "screw" | "belt";
+
+/** 固件种类。auto 表示连接时由版本横幅/$I 自动探测（grblHAL 可能伪装
+ * "Grbl 1.1" 横幅，须以 [FIRMWARE:grblHAL] 为准），探测失败回退预设值。 */
+export type FirmwareKind = "auto" | "grbl-0.9" | "grbl-1.1" | "grblhal";
+
+/** 固件能力项。所有字段支持「自动探测 / 手动指定」双入口，
+ * auto/undefined = 探测；探测逻辑在阶段二 grbl.ts 实现。 */
+export interface FirmwareCapabilities {
+  firmwareKind?: FirmwareKind;
+  /** 串口波特率。GRBL 为编译期属性，连接失败时按档位轮询重试 */
+  baudRate?: 9600 | 57600 | 115200 | 230400 | 250000;
+  /** RX 缓冲区字节数（默认 128，可调 64–256；$I [OPT:] 可探测） */
+  rxBufferSize?: number;
+  /** $H homing 支持（有限位开关与否） */
+  homingSupport?: "auto" | "yes" | "no";
+  /** $10 状态回报格式（0.9 与 1.1 报文不兼容） */
+  statusReport?: "auto" | "v0.9" | "v1.1";
+  /** 设备最大速度 mm/min（$110–$112），供主机时长估算钳制；「从设备读取」回填 */
+  maxVelocityMmMin?: { x?: number; y?: number; z?: number };
+  /** 设备最大加速度 mm/s²（$120–$122），同上 */
+  maxAccelMmS2?: { x?: number; y?: number; z?: number };
+}
+
 export interface DriveParams {
   name: string; // 自定义设备名称
+  /** XY 传动参数：仅用于与设备 $100/$101 校验对照及「参数助手」建议值，
+   * 不参与主机运动学换算（GRBL 下固件 $ 参数是绘制权威）。 */
   stepAngle: number; // 步距角 (度)，典型值 1.8
   microstepping: number; // 驱动细分，典型值 16
   pulleyTeeth: number; // 同步轮齿数，典型值 20
   beltPitch: number; // 同步带齿距 (mm)，典型值 2
+  /** Z 传动参数：用于与设备 $102 校验对照及 Z 轴抬笔行程换算 */
+  zDriveType?: ZDriveType; // 缺省 screw
+  zStepAngle?: number; // 缺省 1.8
+  zMicrostepping?: number; // 缺省 16
+  zLeadMm?: number; // 丝杆导程 (mm/rev)，screw 型必填，典型 8
+  zPulleyTeeth?: number; // belt 型同步轮齿数，典型 20
+  zBeltPitch?: number; // belt 型齿距 (mm)，典型 2
+  /** 抬笔（Z 轴）：落笔 Z 高度 mm（通常 0）、抬笔 Z 高度 mm、Z 进给 mm/min */
+  zPenDownMm?: number; // 默认 0
+  zPenUpMm?: number; // 默认 5
+  zFeedMmMin?: number; // 默认 600
+  /** 固件能力（自动探测 / 手动指定） */
+  firmware?: FirmwareCapabilities;
   /** 自定义硬件的安全工作区域（自原点 0,0 起，mm）。用于绘制前的超界
    * 校验与预览标红；未配置时服务端仅按 Axidraw 档案告警、前端不标红。 */
   workingAreaMm?: { x: number; y: number };
+  /** 机器原点角：设备 (0,0) 位于纸张的哪个角（缺省 top-left）。预览与
+   * 排版始终采用屏幕方位（原点在纸面左上、+X 右、+Y 下），执行层按此
+   * 设置把屏幕坐标映射为机器坐标（applyMachineFrame）。 */
+  originCorner?: OriginCorner;
 }
 
 export interface SavedProfile {
@@ -21,10 +65,48 @@ export interface SavedProfile {
   driveParams: DriveParams;
 }
 
-const BUILTIN_HARDWARE = ["v3", "brushless", "nextdraw-2234", "idraw-h-se"];
+/** 机器原点角。左上 = 绘图仪/SVG 惯例（屏幕坐标即机器坐标，恒等映射）；
+ * 左下 = CNC 常见惯例（+Y 向上）。 */
+export type OriginCorner = "top-left" | "bottom-left" | "top-right" | "bottom-right";
 
-export function isBuiltinHardware(h: string): boolean {
-  return BUILTIN_HARDWARE.includes(h);
+/**
+ * 屏幕坐标（预览/排版口径：原点在纸面左上，+X 右、+Y 下）→ 机器坐标。
+ * 轴方向由原点角推导：原点在左 → +X 指向纸面右方（X 恒等），在右 → X
+ * 关于纸张竖直中线镜像；原点在上 → +Y 指向纸面下方（Y 恒等），在下 →
+ * Y 关于纸张水平中线镜像。
+ *
+ * PenMotion 无 XY 坐标，原样保留；动作序列与时长完全不变，因此补画
+ * 区间、进度索引在屏幕空间与机器空间中一一对应。绘制/补画/归位/G-code
+ * 导出统一在发送前应用本映射，服务端与驱动全程只见机器坐标。
+ */
+/** 机器坐标帧的单点变换（屏幕↔机器；镜像变换自逆，同角再变换即还原）。
+ * applyMachineFrame 的逐点版本：供 G-code 导入把笔画转为 Path 走
+ * paths→replan 正常管线时复用（排版操作对 G-code 导入同样生效）。 */
+export function machineFramePoint(
+  p: Vec2,
+  corner: OriginCorner,
+  paperSizeMm: { x: number; y: number },
+): Vec2 {
+  if (corner === "top-left") return p;
+  return {
+    x: corner.endsWith("right") ? paperSizeMm.x - p.x : p.x,
+    y: corner.startsWith("bottom") ? paperSizeMm.y - p.y : p.y,
+  };
+}
+
+export function applyMachineFrame(
+  plan: Plan,
+  corner: OriginCorner,
+  paperSizeMm: { x: number; y: number },
+): Plan {
+  if (corner === "top-left") return plan;
+  const fx = (p: Vec2): Vec2 => machineFramePoint(p, corner, paperSizeMm);
+  const motions = plan.motions.map((m) =>
+    m instanceof XYMotion
+      ? new XYMotion(m.blocks.map((b) => new Block(b.accel, b.duration, b.vInitial, fx(b.p1), fx(b.p2))))
+      : m,
+  );
+  return new Plan(motions);
 }
 
 export function computeStepsPerMm(d: DriveParams): number {
@@ -36,6 +118,133 @@ export function computeStepsPerMm(d: DriveParams): number {
 export function computeMicrostepsPerMm(d: DriveParams): number {
   return computeStepsPerMm(d) * d.microstepping;
 }
+
+/** Z 轴全步数/mm（与 $102 同口径：全步，不含细分）。screw = 360/zStepAngle ÷ 导程；
+ * belt = 360/zStepAngle ÷ (齿数×齿距)。 */
+export function computeZStepsPerMm(d: DriveParams): number {
+  const stepAngle = d.zStepAngle ?? d.stepAngle;
+  const mmPerRev = d.zDriveType === "belt" ? (d.zPulleyTeeth ?? 20) * (d.zBeltPitch ?? 2) : (d.zLeadMm ?? 8);
+  return 360 / stepAngle / mmPerRev;
+}
+
+/** 参数助手单条对照项（任务 2.7） */
+export interface GrblParamComparison {
+  /** GRBL 参数号（如 "100"） */
+  key: string;
+  label: string;
+  unit: string;
+  /** 设备 `$$` 实值；固件未回报该参数时为 null */
+  device: number | null;
+  /** 档案传动参数换算的建议值；档案未配置时为 null */
+  suggested: number | null;
+  /** true/false = 一致/不一致；null = 一侧缺失无法比较 */
+  match: boolean | null;
+}
+
+const parseSettingNumber = (s: string | undefined): number | null => {
+  if (s == null) return null;
+  const v = Number(s);
+  return Number.isFinite(v) ? v : null;
+};
+
+/** 一致判定：相对误差 ≤0.5% 或绝对差 ≤0.01（吸收 EEPROM 存储的舍入尾差） */
+const GRBL_PARAM_TOL_REL = 0.005;
+
+function compareGrblParam(
+  key: string,
+  label: string,
+  unit: string,
+  device: number | null,
+  suggested: number | null,
+): GrblParamComparison {
+  const match =
+    device == null || suggested == null
+      ? null
+      : Math.abs(device - suggested) <= Math.max(0.01, Math.abs(suggested) * GRBL_PARAM_TOL_REL);
+  return { key, label, unit, device, suggested, match };
+}
+
+/**
+ * 参数助手对照计算：设备 `$$` 实值 vs 档案传动参数换算值（任务 2.7）。
+ * $100/$101 与 XY 微步值（全步 × 细分）对照；$102 与 Z 微步值对照；
+ * $110–$112（mm/min）与档案最大速度对照；$120–$122（mm/s²）与最大加速度对照。
+ */
+export function compareGrblSettings(dp: DriveParams, settings: Record<string, string>): GrblParamComparison[] {
+  const microXY = computeMicrostepsPerMm(dp);
+  const zMicro = computeZStepsPerMm(dp) * (dp.zMicrostepping ?? dp.microstepping);
+  const fw = dp.firmware ?? {};
+  return [
+    compareGrblParam("100", "X 步/mm", "步/mm", parseSettingNumber(settings["100"]), microXY),
+    compareGrblParam("101", "Y 步/mm", "步/mm", parseSettingNumber(settings["101"]), microXY),
+    compareGrblParam("102", "Z 步/mm", "步/mm", parseSettingNumber(settings["102"]), zMicro),
+    compareGrblParam("110", "X 最大速度", "mm/min", parseSettingNumber(settings["110"]), fw.maxVelocityMmMin?.x ?? null),
+    compareGrblParam("111", "Y 最大速度", "mm/min", parseSettingNumber(settings["111"]), fw.maxVelocityMmMin?.y ?? null),
+    compareGrblParam("112", "Z 最大速度", "mm/min", parseSettingNumber(settings["112"]), fw.maxVelocityMmMin?.z ?? null),
+    compareGrblParam("120", "X 最大加速度", "mm/s²", parseSettingNumber(settings["120"]), fw.maxAccelMmS2?.x ?? null),
+    compareGrblParam("121", "Y 最大加速度", "mm/s²", parseSettingNumber(settings["121"]), fw.maxAccelMmS2?.y ?? null),
+    compareGrblParam("122", "Z 最大加速度", "mm/s²", parseSettingNumber(settings["122"]), fw.maxAccelMmS2?.z ?? null),
+  ];
+}
+
+/** GRBL 硬件预设档：作为「新建自定义」的起点模板，选择后可修改并保存为
+ * 命名档案。字段值取 docs/DEVICE_NOTES.md 调研结论的典型配置。 */
+export const GRBL_PRESET_PROFILES: { key: string; label: string; driveParams: DriveParams }[] = [
+  {
+    key: "grbl11-screw",
+    label: "GRBL 1.1 · 丝杆 Z",
+    driveParams: {
+      name: "",
+      stepAngle: 1.8,
+      microstepping: 16,
+      pulleyTeeth: 20,
+      beltPitch: 2, // GT2 带，XY 5 步/mm（全步）
+      zDriveType: "screw",
+      zLeadMm: 8, // T8 丝杆，Z 25 步/mm（全步）
+      zPenDownMm: 0,
+      zPenUpMm: 5,
+      zFeedMmMin: 600,
+      firmware: { firmwareKind: "grbl-1.1", baudRate: 115200, rxBufferSize: 128, homingSupport: "auto", statusReport: "v1.1" },
+    },
+  },
+  {
+    key: "grbl11-belt",
+    label: "GRBL 1.1 · 同步带 Z",
+    driveParams: {
+      name: "",
+      stepAngle: 1.8,
+      microstepping: 16,
+      pulleyTeeth: 20,
+      beltPitch: 2,
+      zDriveType: "belt",
+      zPulleyTeeth: 20,
+      zBeltPitch: 2,
+      zPenDownMm: 0,
+      zPenUpMm: 8, // 同步带 Z 行程通常更大
+      zFeedMmMin: 1200,
+      firmware: { firmwareKind: "grbl-1.1", baudRate: 115200, rxBufferSize: 128, homingSupport: "auto", statusReport: "v1.1" },
+    },
+  },
+  {
+    key: "grblhal",
+    label: "grblHAL · 丝杆 Z",
+    driveParams: {
+      name: "",
+      stepAngle: 1.8,
+      microstepping: 16,
+      pulleyTeeth: 20,
+      beltPitch: 2,
+      zDriveType: "screw",
+      zLeadMm: 8,
+      zPenDownMm: 0,
+      zPenUpMm: 5,
+      zFeedMmMin: 600,
+      firmware: { firmwareKind: "grblhal", baudRate: 115200, rxBufferSize: 128, homingSupport: "auto", statusReport: "v1.1" },
+    },
+  },
+];
+
+/** GRBL 预设档 key 集合（UI 区分「预设模板」与「自定义/已存档案」用） */
+export const GRBL_PRESET_KEYS = GRBL_PRESET_PROFILES.map((p) => p.key);
 
 export interface PlanOptions {
   paperSize: PaperSize;
@@ -72,11 +281,20 @@ export interface PlanOptions {
    * 未提供时按 96dpi 缺省（1px = 25.4/96 mm）。见 util.ts
    * mmPerSvgUnitFromSvg()。 */
   mmPerSvgUnit?: number;
+  /** 导入文件是否为本应用导出的最终排版结果：根节点带 data-b2a-rotate-deg
+   * 标记时为数字（可为 0，表示导出时未旋转），无标记的外部文件为 undefined。
+   * replan 对带标记的文件不再施加「旋转绘制」（坐标已含当时烘焙的旋转，
+   * 重导入所见即所得）；用户主动修改旋转角度时该标记会被清除，旋转恢复生效。 */
+  bakedRotationDeg?: number;
   cropToMargins: boolean;
   placement: Placement;
 
   minimumPathLength: number;
   hardware: string;
+  /** 笔起始/停泊点，机器坐标口径：相对 DriveParams.originCorner 所指的
+   * 机器原点角、向纸面内递增（(0,0) = 机器原点角本身，$H 归位后笔已在
+   * 起点处）。replan 时按原点角换算为屏幕空间坐标供 plan() 使用，执行层
+   * applyMachineFrame 再映射回机器坐标，口径闭环一致。 */
   penHome: Vec2;
   driveParams: DriveParams;
   hiding: boolean;
@@ -111,7 +329,7 @@ export const defaultPlanOptions: PlanOptions = {
   placement: defaultPlacement,
 
   minimumPathLength: 0,
-  hardware: "v3",
+  hardware: "grbl11-screw",
   hiding: false,
   penHome: { x: 0, y: 0 },
   driveParams: {
@@ -120,6 +338,12 @@ export const defaultPlanOptions: PlanOptions = {
     microstepping: 16,
     pulleyTeeth: 20,
     beltPitch: 2,
+    zDriveType: "screw",
+    zLeadMm: 8,
+    zPenDownMm: 0,
+    zPenUpMm: 5,
+    zFeedMmMin: 600,
+    firmware: { firmwareKind: "auto", baudRate: 115200, rxBufferSize: 128, homingSupport: "auto", statusReport: "auto" },
   },
 };
 
@@ -135,7 +359,7 @@ interface Instant {
   a: number;
 }
 
-interface AccelerationProfile {
+export interface AccelerationProfile {
   acceleration: number;
   maximumVelocity: number;
   corneringFactor: number;
@@ -144,130 +368,34 @@ interface AccelerationProfile {
 interface ToolingProfile {
   penDownProfile: AccelerationProfile;
   penUpProfile: AccelerationProfile;
-  penDownPos: number; // int
-  penUpPos: number; // int
+  /** 落笔笔高（penPct 口径：0 = 完全抬笔，100 = 完全落笔） */
+  penDownPos: number;
+  /** 抬笔笔高（penPct 口径） */
+  penUpPos: number;
   penLiftDuration: number;
   penDropDuration: number;
 }
 
-export const getDevice = (hardware = "v3"): Device => {
-  if (hardware === "brushless") return AxidrawBrushless;
-  if (hardware === "nextdraw-2234") return NextDraw2234;
-  if (hardware === "idraw-h-se") return Axidraw;
-  if (hardware === "custom") return Axidraw;
-  return Axidraw;
-};
+// Plan 坐标空间约定（1.4b）：Plan 的全部坐标、速度、加速度均为**毫米口径**
+// （坐标 mm、速度 mm/s、加速度 mm/s²）；PenMotion 位置为 penPct 口径
+// （0 = 完全抬笔，100 = 完全落笔），GRBL 执行层直接线性映射 Z 高度。
 
-export interface Device {
-  stepsPerMm: number;
-  /** 机械可用行程（自原点 0,0 起，mm）。服务端 /plot 据此拒绝超界任务、
-   * 前端预览据此标红超界区域，防止撞轴。custom 硬件沿用 Axidraw 值，
-   * 服务端仅告警不拒绝。 */
-  workingAreaMm: { x: number; y: number };
-  // Practical min/max that you might ever want the pen servo to go on the AxiDraw
-  // Units: 83ns resolution pwm output.
-  penServoMin: number; // pen down
-  penServoMax: number; // pen up
-  penPctToPos: (pct: number) => number;
-}
-
-// Defaults: penup at 12000 (1ms), pendown at 16000 (1.33ms).
-const Axidraw: Device = {
-  stepsPerMm: 5,
-
-  // AxiDraw V3 / iDraw H SE 标称行程
-  workingAreaMm: { x: 430, y: 300 },
-
-  penServoMin: 7500, // pen down
-  penServoMax: 28000, // pen up
-
-  penPctToPos(pct: number): number {
-    const t = pct / 100.0;
-    return Math.round(this.penServoMin * t + this.penServoMax * (1 - t));
-  },
-};
-
-// brushless servo (https://shop.evilmadscientist.com/productsmenu/else?id=56)
-const AxidrawBrushless: Device = {
-  stepsPerMm: 5,
-
-  // 与 AxiDraw V3 相同的机械结构
-  workingAreaMm: { x: 430, y: 300 },
-
-  penServoMin: 5400, // pen down
-  penServoMax: 12600, // pen up
-
-  penPctToPos(pct: number): number {
-    const t = pct / 100.0;
-    return Math.round(this.penServoMin * t + this.penServoMax * (1 - t));
-  },
-};
-
-// NextDraw 2234 with brushless motor that requires 70%+ values
-const NextDraw2234: Device = {
-  stepsPerMm: 5,
-
-  // 22×34 英寸标称行程（型号命名即纸张尺寸，8511/1117 同理）
-  workingAreaMm: { x: 559, y: 864 },
-
-  penServoMin: 19600, // pen down - 70% of range
-  penServoMax: 28000, // pen up - full range
-
-  penPctToPos(pct: number): number {
-    const t = pct / 100.0;
-    return Math.round(this.penServoMin * t + this.penServoMax * (1 - t));
-  },
-};
-
+/** 兼容测试用 ToolingProfile（pct 口径笔高，与 defaultPlanOptions 一致） */
 export const AxidrawFast: ToolingProfile = {
   penDownProfile: {
-    acceleration: 200 * Axidraw.stepsPerMm,
-    maximumVelocity: 50 * Axidraw.stepsPerMm,
-    corneringFactor: 0.127 * Axidraw.stepsPerMm,
+    acceleration: 200,
+    maximumVelocity: 50,
+    corneringFactor: 0.127,
   },
   penUpProfile: {
-    acceleration: 400 * Axidraw.stepsPerMm,
-    maximumVelocity: 200 * Axidraw.stepsPerMm,
+    acceleration: 400,
+    maximumVelocity: 200,
     corneringFactor: 0,
   },
-  penUpPos: Axidraw.penPctToPos(50),
-  penDownPos: Axidraw.penPctToPos(60),
+  penUpPos: 50,
+  penDownPos: 60,
   penDropDuration: 0.12,
   penLiftDuration: 0.12,
-};
-
-export const AxidrawBrushlessFast: ToolingProfile = {
-  penDownProfile: {
-    acceleration: 200 * AxidrawBrushless.stepsPerMm,
-    maximumVelocity: 50 * AxidrawBrushless.stepsPerMm,
-    corneringFactor: 0.127 * AxidrawBrushless.stepsPerMm,
-  },
-  penUpProfile: {
-    acceleration: 400 * AxidrawBrushless.stepsPerMm,
-    maximumVelocity: 200 * AxidrawBrushless.stepsPerMm,
-    corneringFactor: 0,
-  },
-  penUpPos: AxidrawBrushless.penPctToPos(50),
-  penDownPos: AxidrawBrushless.penPctToPos(60),
-  penDropDuration: 0.08,
-  penLiftDuration: 0.08,
-};
-
-export const NextDraw2234Fast: ToolingProfile = {
-  penDownProfile: {
-    acceleration: 200 * NextDraw2234.stepsPerMm,
-    maximumVelocity: 50 * NextDraw2234.stepsPerMm,
-    corneringFactor: 0.127 * NextDraw2234.stepsPerMm,
-  },
-  penUpProfile: {
-    acceleration: 400 * NextDraw2234.stepsPerMm,
-    maximumVelocity: 200 * NextDraw2234.stepsPerMm,
-    corneringFactor: 0,
-  },
-  penUpPos: NextDraw2234.penPctToPos(50),
-  penDownPos: NextDraw2234.penPctToPos(60),
-  penDropDuration: 0.08,
-  penLiftDuration: 0.08,
 };
 
 /**
@@ -505,16 +633,17 @@ export class Plan {
     return this.motions[i];
   }
 
-  public totalDistance(stepsPerMm: number): number {
-    let totalSteps = 0;
+  /** 落笔路径总长度（mm，毫米口径直读）。 */
+  public totalDistance(): number {
+    let total = 0;
     for (const motion of this.motions) {
       if (motion instanceof XYMotion) {
         for (const block of motion.blocks) {
-          totalSteps += block.distance;
+          total += block.distance;
         }
       }
     }
-    return totalSteps / stepsPerMm;
+    return total;
   }
 
   public withPenHeights(penUpHeight: number, penDownHeight: number): Plan {
@@ -724,7 +853,7 @@ function dedupPoints(points: Vec2[], epsilon: number): Vec2[] {
  * @param profile Tooling profile to use
  * @return A plan of action
  */
-function constantAccelerationPlan(points: Vec2[], profile: AccelerationProfile): XYMotion {
+export function constantAccelerationPlan(points: Vec2[], profile: AccelerationProfile): XYMotion {
   const dedupedPoints = dedupPoints(points, epsilon);
   if (dedupedPoints.length === 1) {
     return new XYMotion([new Block(0, 0, 0, dedupedPoints[0], dedupedPoints[0])]);
@@ -834,7 +963,7 @@ export function plan(paths: Vec2[][], profile: ToolingProfile, penHome: Vec2 = {
  * plan() emits a fixed 4-motion group per path:
  *   [travel (XYMotion), pen down (PenMotion), draw (XYMotion), pen up (PenMotion)]
  * A group start is an XYMotion immediately followed by a pen-down PenMotion
- * (pen height decreasing: initialPos > finalPos).
+ * (penPct increasing: initialPos < finalPos; larger pct = lower pen).
  * These indices are the valid resume points for rewind-and-redraw.
  */
 export function pathGroupStarts(plan: Plan): number[] {
@@ -843,7 +972,7 @@ export function pathGroupStarts(plan: Plan): number[] {
   for (let i = 0; i < motions.length - 1; i++) {
     const m = motions[i];
     const next = motions[i + 1];
-    if (m instanceof XYMotion && next instanceof PenMotion && next.initialPos > next.finalPos) {
+    if (m instanceof XYMotion && next instanceof PenMotion && next.initialPos < next.finalPos) {
       starts.push(i);
     }
   }

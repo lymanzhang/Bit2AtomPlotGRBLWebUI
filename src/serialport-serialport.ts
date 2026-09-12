@@ -71,7 +71,10 @@ export class SerialPortSerialPort extends EventEmitter implements SerialPort {
       // An "error" event with no listener throws and kills the process; log it
       // here. Port death is reported via the "close" → "disconnect" chain.
       this._port.on("error", (err) => {
-        console.error(`[bit2atombot] serial port error: ${err.message}`);
+        // 主动 close 时挂起的读操作以 "operation was aborted" 结束：预期路径
+        // （探测失败/正常断开都会触发），不记录避免噪音。
+        if (err.message.includes("aborted")) return;
+        console.error(`[bit2atomplotgrbl] serial port error: ${err.message}`);
       });
       this.readable = readableStreamFromAsyncIterable(this._port);
       this.writable = new WritableStream({

@@ -22,8 +22,6 @@ function asPath(stroke: string, points: Vec2[]): Path {
 // 非 fit 模式下 replan 把输入坐标按 SVG px（96dpi）换算成 mm，测试数据用 mm 表达
 const px = (mm: number) => (mm * 96) / 25.4;
 
-const V3_STEPS_PER_MM = 5;
-
 const CROPPING_OPTS: PlanOptions = {
   ...defaultPlanOptions,
   paperSize: new PaperSize({ x: 100, y: 100 }),
@@ -35,19 +33,19 @@ const CROPPING_OPTS: PlanOptions = {
   layerMode: "stroke",
 };
 
-/** 累计落笔状态下的 XYMotion 距离（不含抬笔空程），单位 mm */
+/** 累计落笔状态下的 XYMotion 距离（不含抬笔空程），单位 mm（Plan 毫米口径
+ * 直读；penPct 口径：finalPos > initialPos = 落笔） */
 function penDownDistance(plan: Plan): number {
-  let totalSteps = 0;
+  let total = 0;
   let penDown = false;
   for (const m of plan.motions) {
     if (m instanceof PenMotion) {
-      penDown = m.finalPos < m.initialPos;
+      penDown = m.finalPos > m.initialPos;
     } else if (m instanceof XYMotion && penDown) {
-      for (const b of m.blocks) totalSteps += b.distance;
+      for (const b of m.blocks) total += b.distance;
     }
   }
-  // 坐标处于全步进空间，换算回 mm
-  return totalSteps / V3_STEPS_PER_MM;
+  return total;
 }
 
 describe("裁剪拆分后的图层过滤（原索引回查）", () => {

@@ -20,12 +20,13 @@
   --canvas-grid10: #cdcdcd;
   --canvas-ruler: #bbb;
   --canvas-ruler-text: #999;
+  --canvas-origin: #d81b60;
   --canvas-progress: rgba(201, 112, 112, 0.9);
 }
 
 body {
   font-family: 'DengXian', '绛夌嚎', 'Microsoft YaHei', sans-serif;
-  font-size: 14px;
+  font-size: 13px;
   color: var(--purple);
   background-color: #f8f8f8;
 }
@@ -361,54 +362,22 @@ path {
 
 
 .control-panel {
-
-
   position: relative;
-
-
   flex: 0 0 var(--panel-width);
-
-
   width: var(--panel-width);
-
-
   background-color: var(--panel-bg);
-
-
   overflow-y: auto;
-  padding-bottom: 150px;
-
-
-
-
-
   box-shadow: 3px 3px 15px rgba(0, 0, 0, 0.2);
-
-
 }
 
-
-
-
-
+/* 绘图设置面板：sticky 跟随滚动常驻底部、参与布局，无需 spacer/padding
+ * 占位（fixed 方案在内容短于视口时会露出大片空白）。 */
 .control-panel-bottom {
-
-
-  position: fixed;
-
-
+  position: sticky;
   bottom: 0;
-
-
-  width: var(--panel-width);
-
-
-  padding-bottom: 0.5rem;
-
-
   background-color: var(--panel-bg);
-
-
+  box-shadow: 0 -3px 12px rgba(0, 0, 0, 0.12);
+  padding-bottom: 0.5rem;
 }
 
 
@@ -469,30 +438,20 @@ path {
 
 
 
+/* ===== 字体层级规则 =====
+ * 一级：.section-header       板块标题    15px / 900
+ * 二级：.drive-group-title    组标题      11px / 700（.drive-group-subtitle 副题 9px / 400 换行随附）
+ * 三级：label / 说明文字      9px / 11px
+ * 控件（input/button/select）：11px，主绘制按钮 14px。
+ * 全部调小一档以避免 260px 面板内中文换行。 */
 .section-header {
-
-
   margin-bottom: 1rem;
-
-
   padding: 0.5rem 0;
-
-
   border-bottom: 1px solid var(--purple-light);
-
-
-  font-size: 18px;
-
-
+  font-size: 15px;
   font-weight: 900;
-
-
   text-align: center;
-
-
   user-select: none;
-
-
 }
 
 
@@ -545,9 +504,7 @@ form {
 
 
 label {
-
-
-  font-size: 10px;
+  font-size: 9px;
 
 
   text-align: center;
@@ -566,38 +523,16 @@ label {
 
 
 input[type=number], input[type=text], textarea {
-
-
   width: 100%;
-
-
   padding: 0.3rem;
-
-
   margin-bottom: 0.5rem;
-
-
   border: 1px solid var(--purple);
-
-
   font-family: 'DengXian', '绛夌嚎', 'Microsoft YaHei', sans-serif;
-
-
-  font-size: 14px;
-
-
+  font-size: 11px;
   color: var(--purple);
-
-
   background-color: white;
-
-
   box-shadow: 1px 1px 2px rgba(0, 0, 0, 0.1);
-
-
   outline: none;
-
-
 }
 
 
@@ -680,47 +615,50 @@ input[type=checkbox]:checked:after {
 
 
 button, select {
-
-
   width: 100%;
-
-
   margin-bottom: 0.5rem;
-
-
   padding: 0.4rem;
-
-
   font-family: 'DengXian', '绛夌嚎', 'Microsoft YaHei', sans-serif;
-
-
-  font-size: 14px;
-
-
+  font-size: 11px;
   font-weight: 700;
-
-
   background-color: white;
-
-
   color: var(--purple);
-
-
   border: 1px solid var(--purple);
-
-
   border-radius: 0;
-
-
   box-shadow: 1px 1px 2px rgba(0, 0, 0, 0.1);
-
-
   cursor: pointer;
-
-
   outline: none;
+}
 
+/* 按钮与输入框/下拉框视觉区分：按钮浅灰填充 + 深边框（输入框/下拉框保持
+ * 白底），文字水平垂直居中 */
+button {
+  background-color: #e6e6e6;
+  border-color: #6f6f6f;
+  text-align: center;
+  justify-content: center;
+}
+button:not(:disabled):hover {
+  background-color: #dadada;
+}
 
+/* 下拉框：关闭态选中值与展开后的各选项文字均居中 */
+select {
+  text-align: center;
+  text-align-last: center;
+}
+select option {
+  text-align: center;
+}
+
+/* 设备名称等指定输入框的文字居中 */
+.center-text {
+  text-align: center;
+}
+
+/* 局部更小字段标签（如三列行中的「Z 进给 (mm/min)」，防止换行顶下输入框） */
+.label-xs {
+  font-size: 8px;
 }
 
 
@@ -821,61 +759,7 @@ button:not(:disabled):active {
 
 
 
-/* button-link is a button element that looks like a link */
-
-
-button.button-link {
-
-
-  display: block;
-
-
-  padding: 0;
-
-
-  border: none;
-
-
-  font-size: 10px;
-
-
-  text-decoration: none;
-
-
-  background-color: transparent;
-
-
-  box-shadow: none;
-
-
-  font-weight: 400;
-
-
-}
-
-
-
-
-
-button.button-link:hover,
-
-
-button.button-link:active,
-
-
-button.button-link:focus {
-
-
-  box-shadow: none;
-
-
-  background-color: transparent;
-
-
-  text-decoration: underline;
-
-
-}
+/* button-link样式已随「重置所有选项」改为常规按钮而移除 */
 
 
 
@@ -917,33 +801,10 @@ select[multiple]:focus option:checked {
 .flex button,
 
 
-.flex label {
-
-
-  width: calc(50% - 0.25rem);
-
-
-  align-self: flex-end;
-
-
-}
-
-
-
-
-
 .flex-checkbox {
-
-
   display: flex;
-
-
   align-items: center;
-
-
   margin-bottom: 0.5rem;
-
-
 }
 
 
@@ -1069,14 +930,6 @@ select[multiple]:focus option:checked {
 
 
 
-
-.spacer {
-
-
-  height: 200px;
-
-
-}
 
 
 
@@ -1218,14 +1071,8 @@ summary:focus {
 
 
 .section-body__plot button {
-
-
   padding: 0.4rem;
-
-
-  font-size: 18px;
-
-
+  font-size: 14px;
 }
 
 
@@ -1247,51 +1094,52 @@ summary:focus {
 
 
 
+/* 高权重操作按钮（模拟绘制/开始绘制/补画）：非激活蓝、进行中红 */
 .plot-button {
-
-
   color: white;
-
-
-  background-color: var(--teal);
-
-
-  border: 1px solid var(--teal-dark);
-
-
+  background-color: #1e6fd2;
+  border: 1px solid #14509a;
 }
-
 
 .plot-button:not(:disabled):active {
-
-
   color: white;
-
-
-  background-color: var(--teal);
-
-
+  background-color: #1e6fd2;
 }
-
 
 .plot-button:disabled {
-
-
-  color: var(--teal-light);
-
-
+  color: #9dbce0;
   background-color: white;
-
-
+  border-color: #b6cbe4;
 }
 
+.plot-button--plotting,
+.plot-button--plotting:disabled {
+  background-color: #d32f2f;
+  border-color: #9a1f1f;
+  color: white;
+}
 
-.plot-button--plotting {
-
-
-  background-color: var(--teal-light);
-
-
+/* 通用蓝/红状态按钮 */
+.btn-blue {
+  background-color: #1e6fd2;
+  border-color: #14509a;
+  color: #fff;
+}
+.btn-blue:not(:disabled):hover {
+  background-color: #2f80e0;
+}
+.btn-blue:disabled {
+  background-color: #b6cbe4;
+  border-color: #a3bad4;
+  color: #f2f6fa;
+}
+.btn-red {
+  background-color: #d32f2f;
+  border-color: #9a1f1f;
+  color: #fff;
+}
+.btn-red:not(:disabled):hover {
+  background-color: #e0403f;
 }
 
 
@@ -1299,27 +1147,40 @@ summary:focus {
 
 
 .button-row {
-
-
   display: flex;
-
-
 }
-
-
 .button-row > *:not(:first-child) {
-
-
   margin-left: 10px;
-
-
+}
+/* 行内按钮均分宽度（同行两按钮各占一半） */
+.button-row > button {
+  flex: 1 1 0;
+  min-width: 0;
+}
+/* 可折叠「更多设备配置」：summary 复用 .section-header 视觉（与「更多设置」
+ * 一致），仅保留折叠件的间距与内容缩进 */
+.device-config {
+  margin-bottom: 0.5rem;
+}
+.device-config-body {
+  margin-top: 8px;
+}
+/* 纵向按钮列：窄面板中多按钮并排会导致中文换行，改为逐行全宽 */
+.button-column {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.button-column > * {
+  margin-bottom: 0;
+  margin-left: 0;
 }
 
 
 /* 暂停回溯重绘控制条 */
 .rewind-controls {
   margin-top: 10px;
-  padding: 10px;
+  padding: 12px;
   border: 1px solid var(--canvas-stroke-rewind);
   border-radius: 6px;
   background: rgba(229, 57, 53, 0.06);
@@ -1332,25 +1193,89 @@ summary:focus {
 }
 
 .rewind-info {
-  font-size: 12px;
-  line-height: 1.5;
-  margin-bottom: 8px;
+  font-size: 10px;
+  line-height: 1.6;
+  margin-bottom: 10px;
 }
 
 .rewind-slider-row {
   display: flex;
   align-items: center;
-  gap: 10px;
+  /* 小间距：滑块尽量贴近「起点/终点」固定文字，把宽度留给滑轨（分辨率） */
+  gap: 4px;
+  margin: 8px 0;
 }
 
+/* min-width: 0 允许滑块收缩到固有宽度以下——range 是表单控件，flex 子项
+ * 默认 min-width:auto 会卡在固有宽度(~129px)，把右侧「第 X 条」标签挤出
+ * 面板裁掉（表现为滑轨右端残留一个文字碎片白点） */
 .rewind-slider {
   flex: 1;
+  min-width: 0;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 10px;
+  background: transparent;
+  margin: 0;
+}
+/* 自绘滑轨：细轨 + 小圆点（原生控件轨道与拇指过大），宽度由 flex 撑满
+ * 「起点/终点」与条号标签之间的剩余空间 */
+.rewind-slider::-webkit-slider-runnable-track {
+  height: 2px;
+  border-radius: 1px;
+  background: #b0b0b0;
+}
+.rewind-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 8px;
+  height: 8px;
+  /* (轨道 2px - 圆点 8px) / 2 = -3px，圆点垂直居中于轨道 */
+  margin-top: -3px;
+  border-radius: 50%;
+  background: #1e6fd2;
+  border: none;
+}
+.rewind-slider::-moz-range-track {
+  height: 2px;
+  border-radius: 1px;
+  background: #b0b0b0;
+}
+.rewind-slider::-moz-range-thumb {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #1e6fd2;
+  border: none;
+}
+[data-theme="dark"] .rewind-slider::-webkit-slider-runnable-track {
+  background: #5a5a5a;
+}
+[data-theme="dark"] .rewind-slider::-moz-range-track {
+  background: #5a5a5a;
+}
+[data-theme="dark"] .rewind-slider::-webkit-slider-thumb {
+  background: #3d7cc0;
+}
+[data-theme="dark"] .rewind-slider::-moz-range-thumb {
+  background: #3d7cc0;
+}
+
+/* 首列固定为「起点/终点」方位标签；右列显示当前条号，两行滑块的滑轨
+ * 因此左右对齐。起点/终点文字宽稳定，滑块紧贴其后以换取最大轨道宽度 */
+.rewind-slider-row > .rewind-slider-label:first-child {
+  min-width: 26px;
+  text-align: left;
+  flex: none;
 }
 
 .rewind-slider-label {
-  min-width: 64px;
+  min-width: 40px;
   text-align: right;
-  font-size: 12px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  flex: none;
+  white-space: nowrap;
 }
 
 
@@ -1411,15 +1336,42 @@ summary:focus {
 
 
 
+/* 通用行布局：任意数量的列均分宽度，8px 列间距。
+ * 历史问题：label 写死 width: calc(50% - 0.25rem)，三列行会溢出换行，
+ * 各行宽度忽大忽小。现统一 flex:1 均分。 */
 .flex {
-
-
   display: flex;
+  gap: 8px;
+}
+.flex > label {
+  flex: 1 1 0;
+  min-width: 0;
+}
 
+/* 控件统一高度：输入框与下拉框同高（28px），消除行内高低不齐 */
+input[type="number"],
+input[type="text"],
+select {
+  height: 28px;
+  box-sizing: border-box;
+}
 
+/* 换算结果行：主名 + 更小字号的括号副题（换行显示），值右对齐 */
+.drive-result-row {
+  display: flex;
+  align-items: center;
   justify-content: space-between;
-
-
+  margin-bottom: 6px;
+}
+.drive-result-label {
+  font-size: 11px;
+  font-weight: 700;
+}
+.drive-result-sub {
+  display: block;
+  font-size: 9px;
+  font-weight: 400;
+  opacity: 0.72;
 }
 
 
@@ -1462,6 +1414,48 @@ summary:focus {
 
 
 
+/* 二级组标题：破折号后的说明下沉为副题（换行 + 更小字号）；
+ * 主标题与副题成对居中排版 */
+.drive-group-title {
+  margin: 8px 0 4px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--purple-dark);
+  text-align: center;
+  user-select: none;
+}
+.drive-group-subtitle {
+  display: block;
+  font-size: 9px;
+  font-weight: 400;
+  color: var(--purple);
+  opacity: 0.75;
+  line-height: 1.4;
+  text-align: center;
+}
+/* 行内字段组标题（如「最大速度 (mm/min)」+ X/Y/Z 三列输入） */
+.field-group-title {
+  margin: 6px 0 2px;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--purple-dark);
+  text-align: center;
+  user-select: none;
+}
+
+/* 组级灰色小字说明：解释参数的实际作用域（主机估算 vs 设备 $ 参数） */
+.field-hint {
+  margin: 2px 0 4px;
+  font-size: 9px;
+  line-height: 1.5;
+  color: #888888;
+}
+/* 联动校验告警（如绘制进给超过 $110/$111 上限将被钳制） */
+.field-hint--warn {
+  color: #d32f2f;
+  font-weight: 700;
+}
+
 .drive-params-result {
 
 
@@ -1476,6 +1470,47 @@ summary:focus {
 
 }
 
+/* 2.7 参数助手对照表 */
+.param-compare {
+  margin-top: 6px;
+  border: 1px solid var(--purple-light);
+  padding: 4px;
+  font-size: 11px;
+}
+
+.param-compare-row {
+  display: flex;
+  gap: 6px;
+  line-height: 1.5;
+}
+
+.param-compare-row > span:nth-child(1) {
+  width: 42px;
+  flex: none;
+}
+
+.param-compare-row > span:nth-child(2) {
+  flex: 1;
+}
+
+.param-compare-row > span:nth-child(n + 3) {
+  width: 64px;
+  flex: none;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.param-compare-head {
+  font-weight: 700;
+  user-select: none;
+}
+
+.param-compare-error {
+  margin-top: 4px;
+  color: #c0392b;
+  font-size: 11px;
+}
+
 
 
 
@@ -1488,7 +1523,7 @@ summary:focus {
 /* Export SVG button */
 .export-svg-btn {
   margin-top: 0.5rem;
-  font-size: 14px;
+  font-size: 11px;
 }
 
 /* Replan button (disabled state) */
@@ -1506,7 +1541,7 @@ summary:focus {
   z-index: 10;
   width: auto;
   padding: 4px 12px;
-  font-size: 12px;
+  font-size: 11px;
 }
 
 /* Progress bar */
@@ -1570,9 +1605,7 @@ summary:focus {
 
 
 .progress-bar-label {
-
-
-  font-size: 12px;
+  font-size: 11px;
 
 
   font-weight: 700;
@@ -1619,6 +1652,7 @@ summary:focus {
   --canvas-grid10: #4a4a4a;
   --canvas-ruler: #6a6a6a;
   --canvas-ruler-text: #9d9d9d;
+  --canvas-origin: #ff80ab;
   --canvas-progress: rgba(201, 112, 112, 0.9);
 }
 
@@ -1653,6 +1687,15 @@ summary:focus {
   border-color: #3c3c3c;
 }
 
+/* 暗色主题：按钮较输入框更亮的填充 + 更亮的边框，保持视觉区分 */
+[data-theme="dark"] button {
+  background-color: #3a3a3a;
+  border-color: #5a5a5a;
+}
+[data-theme="dark"] button:not(:disabled):hover {
+  background-color: #454545;
+}
+
 [data-theme="dark"] input[type=checkbox] {
   border-color: #3c3c3c;
 }
@@ -1681,26 +1724,48 @@ summary:focus {
   color: #e8e8e8;
 }
 
-/* Primary action button — light gray on dark */
+/* Primary action button — blue on dark, red while plotting */
 [data-theme="dark"] .plot-button {
-  background-color: #4a4a4a;
-  border-color: #5a5a5a;
+  background-color: #1e5fa8;
+  border-color: #3d7cc0;
   color: #ffffff;
 }
 
 [data-theme="dark"] .plot-button:not(:disabled):active {
-  background-color: #5a5a5a;
+  background-color: #2a6fba;
   color: #ffffff;
 }
 
 [data-theme="dark"] .plot-button:disabled {
-  color: #6a6a6a;
+  color: #5a6a7a;
   background-color: #2d2d2d;
   border-color: #3c3c3c;
 }
 
-[data-theme="dark"] .plot-button--plotting {
-  background-color: #3a3a3a;
+[data-theme="dark"] .plot-button--plotting,
+[data-theme="dark"] .plot-button--plotting:disabled {
+  background-color: #a82b2b;
+  border-color: #c85a5a;
+}
+
+[data-theme="dark"] .btn-blue {
+  background-color: #1e5fa8;
+  border-color: #3d7cc0;
+}
+[data-theme="dark"] .btn-blue:not(:disabled):hover {
+  background-color: #2a6fba;
+}
+[data-theme="dark"] .btn-blue:disabled {
+  background-color: #2a3a4d;
+  border-color: #3a4a5d;
+  color: #8899aa;
+}
+[data-theme="dark"] .btn-red {
+  background-color: #a82b2b;
+  border-color: #c85a5a;
+}
+[data-theme="dark"] .btn-red:not(:disabled):hover {
+  background-color: #b83a3a;
 }
 
 [data-theme="dark"] .cancel-button {
@@ -1755,6 +1820,23 @@ summary:focus {
 
 [data-theme="dark"] label {
   color: #9d9d9d;
+}
+
+[data-theme="dark"] .drive-group-title {
+  color: #e8e8e8;
+}
+
+[data-theme="dark"] .drive-group-subtitle,
+[data-theme="dark"] .field-group-title {
+  color: #cccccc;
+}
+
+[data-theme="dark"] .field-hint {
+  color: #9a9a9a;
+}
+
+[data-theme="dark"] .field-hint--warn {
+  color: #e57373;
 }
 
 [data-theme="dark"] .layer-select {
@@ -1852,7 +1934,7 @@ summary:focus {
   border-radius: 4px;
   background: rgba(0, 0, 0, 0.45);
   color: whitesmoke;
-  font-size: 12px;
+  font-size: 11px;
   user-select: none;
   z-index: 10;
 }
@@ -1867,7 +1949,7 @@ summary:focus {
   border-radius: 4px;
   background: rgba(244, 67, 54, 0.92);
   color: #fff;
-  font-size: 12px;
+  font-size: 11px;
   user-select: none;
   pointer-events: none;
   z-index: 10;
@@ -1882,7 +1964,7 @@ summary:focus {
   color: inherit;
   padding: 1px 7px;
   cursor: pointer;
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1.4;
   box-shadow: none;
 }

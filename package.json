@@ -23,7 +23,8 @@
   },
   "scripts": {
     "lint": "biome lint src",
-    "build": "npm run build:server && npm run build:ui",
+    "typecheck": "tsc --project tsconfig.server.json --noEmit && tsc --project tsconfig.ui.json --noEmit",
+    "build": "npm run typecheck && npm run build:server && npm run build:ui",
     "build:server": "tsc --project tsconfig.server.json",
     "build:ui": "node --experimental-modules build.mjs",
     "prepare": "rimraf dist && npm run build",

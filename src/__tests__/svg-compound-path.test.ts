@@ -25,7 +25,7 @@ describe("readSvg 复合路径矩阵映射（cloud04 回归）", () => {
     HTMLParser(noDecl, doc);
     const svg = doc.documentElement;
     // DOMParser 解析的未挂载 SVG 中 getCTM() 恒为 null/identity（与浏览器一致）
-    for (const el of svg.querySelectorAll("*")) (el as any).getCTM = () => null;
+    for (const el of svg.querySelectorAll("*")) (el as any).getCTM = (): null => null;
 
     const shapes = [...svg.querySelectorAll("path")];
     const paths = flattenSVG(svg as any, {});

@@ -1,7 +1,7 @@
 import type { Path } from "flatten-svg";
 import { elideShorterThan, merge as joinNearbyPaths, reorder as sortPaths } from "optimize-paths";
 import { removeHiddenLines } from "./hiding.js";
-import { computeStepsPerMm, getDevice, isBuiltinHardware, type Plan, type PlanOptions, plan } from "./planning.js";
+import { type Plan, type PlanOptions, plan } from "./planning.js";
 import { alignToMargins, cropToMargins, dedupPoints, defaultMmPerSvgUnit, defaultPlacement, scaleToPaper } from "./util.js";
 import { type Vec2, vmul, vrot } from "./vec.js";
 
@@ -21,22 +21,24 @@ export function replan(inPaths: Path[], planOptions: PlanOptions): Plan {
   // 由 mmPerSvgUnitFromSvg() 按 width_mm ÷ viewBox 宽推算（非 96dpi 导出
   // 的文件也能还原真实尺寸）；缺省按 96dpi（1px = 25.4/96 mm）。
   const mmPerUnit = planOptions.mmPerSvgUnit ?? defaultMmPerSvgUnit;
-  const device = getDevice(planOptions.hardware);
-  const effectiveStepsPerMm = isBuiltinHardware(planOptions.hardware)
-    ? device.stepsPerMm
-    : computeStepsPerMm(planOptions.driveParams);
 
   // Rotate drawing around center of paper to handle plotting portrait drawings
   // along y-axis of plotter
   // Rotate around the center of the page, but in SvgUnits (not mm)
-  if (planOptions.rotateDrawing !== 0) {
+  // 本应用导出的 SVG（根节点带 data-b2a-rotate-deg 标记）是最终排版结果，
+  // 坐标已含当时烘焙的旋转——重导入时不再施加任何旋转（所见即所得），
+  // 否则每导出/导入一圈都会再叠一次旋转（图形越转越偏、越缩越小）。
+  // 用户主动修改「旋转角度」时会清除该标记（ui.tsx 输入处理器），旋转恢复生效。
+  // 外部 SVG 无标记 → 正常应用 rotateDrawing。
+  const rotationDeg = planOptions.bakedRotationDeg != null ? 0 : planOptions.rotateDrawing;
+  if (rotationDeg !== 0) {
     console.time("rotating paths");
     paths = paths.map((pl) =>
       pl.map((p) =>
         vrot(
           p,
           vmul({ x: planOptions.paperSize.size.x / 2, y: planOptions.paperSize.size.y / 2 }, 1 / mmPerUnit),
-          planOptions.rotateDrawing,
+          rotationDeg,
         ),
       ),
     );
@@ -155,30 +157,40 @@ export function replan(inPaths: Path[], planOptions: PlanOptions): Plan {
     console.timeEnd("joining nearby paths");
   }
 
-  // Convert the paths to units of "steps".
-  paths = paths.map((ps) => ps.map((p) => vmul(p, effectiveStepsPerMm)));
-
-  // And finally, motion planning.
+  // And finally, motion planning.（路径已在毫米口径）
+  // penHome 为机器坐标口径（相对机器原点角、向纸面内递增，(0,0) = 原点角
+  // 本身）：先换算为屏幕空间坐标再交给 plan()，保证预览中起点圈落在原点
+  // 角、且执行层 applyMachineFrame 把它映射回机器 (penHome) —— 默认
+  // (0,0) 时 $H 归位后笔已在起点，不再从对角斜穿纸面长程空跑。
+  const originCorner = planOptions.driveParams?.originCorner ?? "top-left";
+  const penHomeScreen = {
+    x: originCorner.endsWith("right")
+      ? planOptions.paperSize.size.x - planOptions.penHome.x
+      : planOptions.penHome.x,
+    y: originCorner.startsWith("bottom")
+      ? planOptions.paperSize.size.y - planOptions.penHome.y
+      : planOptions.penHome.y,
+  };
   console.time("planning pen motions");
   const theplan = plan(
     paths,
     {
-      penUpPos: device.penPctToPos(planOptions.penUpHeight),
-      penDownPos: device.penPctToPos(planOptions.penDownHeight),
+      penUpPos: planOptions.penUpHeight,
+      penDownPos: planOptions.penDownHeight,
       penDownProfile: {
-        acceleration: planOptions.penDownAcceleration * effectiveStepsPerMm,
-        maximumVelocity: planOptions.penDownMaxVelocity * effectiveStepsPerMm,
-        corneringFactor: planOptions.penDownCorneringFactor * effectiveStepsPerMm,
+        acceleration: planOptions.penDownAcceleration,
+        maximumVelocity: planOptions.penDownMaxVelocity,
+        corneringFactor: planOptions.penDownCorneringFactor,
       },
       penUpProfile: {
-        acceleration: planOptions.penUpAcceleration * effectiveStepsPerMm,
-        maximumVelocity: planOptions.penUpMaxVelocity * effectiveStepsPerMm,
+        acceleration: planOptions.penUpAcceleration,
+        maximumVelocity: planOptions.penUpMaxVelocity,
         corneringFactor: 0,
       },
       penDropDuration: planOptions.penDropDuration,
       penLiftDuration: planOptions.penLiftDuration,
     },
-    vmul(planOptions.penHome, effectiveStepsPerMm),
+    penHomeScreen,
   );
   console.timeEnd("planning pen motions");
 

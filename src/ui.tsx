@@ -18,19 +18,28 @@ import React, {
 } from "react";
 import { createRoot } from "react-dom/client";
 import { planToSvg } from "./export-svg.js";
+import { planToGCode } from "./export-gcode.js";
+import { parseGcode } from "./gcode-import.js";
 import { PaperSize } from "./paper-size";
 import {
   computeMicrostepsPerMm,
   computeStepsPerMm,
+  computeZStepsPerMm,
   defaultPlanOptions,
-  getDevice,
-  isBuiltinHardware,
+  type GrblParamComparison,
+  GRBL_PRESET_KEYS,
+  GRBL_PRESET_PROFILES,
   type MotionData,
   Plan,
   type PlanOptions,
   pathGroupStarts,
   type SavedProfile,
   XYMotion,
+  type FirmwareKind,
+  type OriginCorner,
+  type ZDriveType,
+  applyMachineFrame,
+  machineFramePoint,
 } from "./planning.js";
 import useComponentSize from "./useComponentSize.js";
 import { defaultPlacement, formatDuration, mmPerSvgUnitFromSvg, type Placement } from "./util.js";
@@ -38,7 +47,7 @@ import { defaultPlacement, formatDuration, mmPerSvgUnitFromSvg, type Placement }
 import "./style.css";
 import bit2atomLogo from "./bit2atomLogo.svg";
 import { type BaseDriver, Bit2AtomDriver, type DeviceInfo, WebSerialDriver } from "./drivers";
-import type { Hardware } from "./ebb";
+import type { Hardware } from "./device-controller.js";
 import pathJoinRadiusIcon from "./icons/path-joining radius.svg";
 import pointJoinRadiusIcon from "./icons/point-joining radius.svg";
 import rotateDrawingIcon from "./icons/rotate-drawing.svg";
@@ -121,6 +130,9 @@ type Action =
       /** 本次加载的 SVG 推算出的用户单位→mm 换算系数（无绝对单位时为
        * undefined，规划时回退 96dpi 缺省值）。每次加载文件都会整体替换。 */
       mmPerSvgUnit?: number;
+      /** 导入文件坐标已烘焙的旋转角（度）。仅本应用导出的 SVG 携带
+       * data-b2a-rotate-deg 标记，外部文件为 0。每次加载文件都会整体替换。 */
+      bakedRotationDeg?: number;
     }
   | { type: "CLEAR_PATHS" };
 
@@ -145,13 +157,26 @@ function reducer(state: State, action: Action): State {
     case "SET_PAUSED":
       return { ...state, paused: action.value };
     case "SET_PATHS": {
-      const { paths, strokeLayers, selectedStrokeLayers, groupLayers, selectedGroupLayers, layerMode, mmPerSvgUnit } = action;
+      const { paths, strokeLayers, selectedStrokeLayers, groupLayers, selectedGroupLayers, layerMode, mmPerSvgUnit, bakedRotationDeg } = action;
       return {
         ...state,
         paths,
         groupLayers,
         strokeLayers,
-        planOptions: { ...state.planOptions, selectedStrokeLayers, selectedGroupLayers, layerMode, mmPerSvgUnit },
+        planOptions: {
+          ...state.planOptions,
+          selectedStrokeLayers,
+          selectedGroupLayers,
+          layerMode,
+          mmPerSvgUnit,
+          bakedRotationDeg,
+          // 载入新文件时排版参数回归缺省：这些参数持久化在 localStorage，
+          // 若不复位，上一次会话的旋转/对齐/缩放设置会被静默套用到新文件
+          // （典型事故：上次设过「旋转 90°」，这次读入的图就莫名转了 90°）。
+          rotateDrawing: 0,
+          placement: { ...defaultPlacement },
+          scaleMode: "fit",
+        },
       };
     }
     case "CLEAR_PATHS":
@@ -208,12 +233,8 @@ function attemptRejigger(previousOptions: PlanOptions, newOptions: PlanOptions, 
     penDownHeight: previousOptions.penDownHeight,
   };
   if (serialize(previousOptions) === serialize(newOptionsWithOldPenHeights)) {
-    const device = getDevice(newOptions.hardware);
-    // The existing plan should be the same except for penup/pendown heights.
-    return previousPlan.withPenHeights(
-      device.penPctToPos(newOptions.penUpHeight),
-      device.penPctToPos(newOptions.penDownHeight),
-    );
+    // Plan 笔位为 pct 口径（0 = 完全抬笔，100 = 完全落笔），直接复用
+    return previousPlan.withPenHeights(newOptions.penUpHeight, newOptions.penDownHeight);
   }
   return null;
 }
@@ -267,7 +288,7 @@ const usePlan = (paths: Path[] | null, planOptions: PlanOptions) => {
   return { isPlanning, plan: latestPlan, setPlan };
 };
 
-const setPaths = (paths: Path[], mmPerSvgUnit?: number): Action => {
+const setPaths = (paths: Path[], mmPerSvgUnit?: number, bakedRotationDeg = 0): Action => {
   const strokes = new Set<string>();
   const groups = new Set<string>();
   for (const path of paths) {
@@ -286,6 +307,7 @@ const setPaths = (paths: Path[], mmPerSvgUnit?: number): Action => {
     selectedStrokeLayers: new Set(strokeLayers),
     layerMode,
     mmPerSvgUnit,
+    bakedRotationDeg,
   };
 };
 
@@ -307,21 +329,196 @@ function DriveParams({ state }: { state: State }) {
   const dp = state.planOptions.driveParams;
   const set = (partial: Partial<typeof dp>) =>
     dispatch({ type: "SET_PLAN_OPTION", value: { driveParams: { ...dp, ...partial } } });
+  const setFw = (partial: Partial<NonNullable<typeof dp.firmware>>) =>
+    set({ firmware: { ...dp.firmware, ...partial } });
+  // 工作区输入用本地文本态：直接绑 Number 值时，输入第一个数字会因
+  // 「另一维度尚未填写 → 视为未配置清空」被立刻抹掉，表现为无法输入。
+  const [waText, setWaText] = useState(() => ({
+    x: dp.workingAreaMm?.x != null ? String(dp.workingAreaMm.x) : "",
+    y: dp.workingAreaMm?.y != null ? String(dp.workingAreaMm.y) : "",
+  }));
+  // 档案切换/反向同步等外部变更回填文本（仅当与当前文本解析值不同，避免覆盖输入中内容）
+  React.useEffect(() => {
+    setWaText((t) => {
+      const nx = dp.workingAreaMm?.x;
+      const ny = dp.workingAreaMm?.y;
+      return {
+        x: nx != null && Number(t.x) !== nx ? String(nx) : t.x,
+        y: ny != null && Number(t.y) !== ny ? String(ny) : t.y,
+      };
+    });
+  }, [dp.workingAreaMm?.x, dp.workingAreaMm?.y]);
   const setWorkingArea = (axis: "x" | "y", raw: string) => {
+    const next = { ...waText, [axis]: raw };
+    setWaText(next);
+    const x = Number(next.x);
+    const y = Number(next.y);
+    // 两维均为有效正数才提交；否则视为未配置（服务端仅告警）。文本保留，
+    // 允许「先填宽、再填高」的输入过程。
+    set({ workingAreaMm: x > 0 && y > 0 ? { x, y } : undefined });
+  };
+  // $110-$112 最大速度（mm/min）单轴回填；0/负值视为未配置
+  const setMaxVel = (axis: "x" | "y" | "z", raw: string) => {
     const v = Number(raw);
-    const base = { ...dp.workingAreaMm, x: dp.workingAreaMm?.x ?? 0, y: dp.workingAreaMm?.y ?? 0 };
-    base[axis] = v;
-    // 任一维度为空/非正时视为未配置，清空整个工作区（服务端仅告警）
-    set({ workingAreaMm: base.x > 0 && base.y > 0 ? { x: base.x, y: base.y } : undefined });
+    setFw({ maxVelocityMmMin: { ...(dp.firmware?.maxVelocityMmMin ?? {}), [axis]: v > 0 ? v : undefined } });
+  };
+  const setMaxAccel = (axis: "x" | "y" | "z", raw: string) => {
+    const v = Number(raw);
+    setFw({ maxAccelMmS2: { ...(dp.firmware?.maxAccelMmS2 ?? {}), [axis]: v > 0 ? v : undefined } });
   };
   const stepsPerMm = computeStepsPerMm(dp);
   const microstepsPerMm = computeMicrostepsPerMm(dp);
+  const zStepsPerMm = computeZStepsPerMm(dp);
+  const zType = dp.zDriveType ?? "screw";
+  const fw = dp.firmware ?? {};
+
+  // ---- 2.7 参数助手 ----
+  const [probe, setProbe] = useState<{ comparisons: GrblParamComparison[] } | null>(null);
+  const [probeError, setProbeError] = useState<string | null>(null);
+  const [probing, setProbing] = useState(false);
+  const fmtVal = (v: number) => Number(v.toFixed(4)).toString();
+  const deviceVal = (key: string) => probe?.comparisons.find((c) => c.key === key)?.device ?? null;
+
+  const readDeviceParams = async (): Promise<void> => {
+    setProbing(true);
+    setProbeError(null);
+    try {
+      const res = await fetch("/grbl/params", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(dp),
+      });
+      if (!res.ok) {
+        setProbe(null);
+        setProbeError(await res.text());
+        return;
+      }
+      setProbeError(null);
+      setProbe((await res.json()) as { comparisons: GrblParamComparison[] });
+    } catch (e) {
+      setProbeError((e as Error).message);
+    } finally {
+      setProbing(false);
+    }
+  };
+
+  /** 反向同步（推荐方向）：以设备 $$ 实值为准回填档案。XY/Z 细分由设备
+   * 步/mm 除以档案全步密度整周导出；速度/加速度直接回填。 */
+  const syncFromDevice = (): void => {
+    if (!probe) return;
+    const next = { ...dp };
+    const changes: string[] = [];
+    // XY 细分回解：$100（缺则 $101）÷ 全步/mm ≈ 整数细分
+    const xyFull = computeStepsPerMm(dp);
+    const devXY = deviceVal("100") ?? deviceVal("101");
+    if (devXY != null && xyFull > 0) {
+      const micro = Math.round(devXY / xyFull);
+      if (micro >= 1 && Math.abs(devXY - micro * xyFull) <= Math.max(0.01, devXY * 0.005)) {
+        if (micro !== dp.microstepping) {
+          next.microstepping = micro;
+          changes.push(`细分 ${dp.microstepping} → ${micro}（$100=${fmtVal(devXY)}）`);
+        }
+      } else {
+        changes.push(
+          `$100=${fmtVal(devXY)} 无法由档案传动参数（全步 ${fmtVal(xyFull)} 步/mm）整除出细分，请核对步距角/齿数/齿距`,
+        );
+      }
+    }
+    // Z 细分回解：$102 ÷ Z 全步/mm
+    const zFull = computeZStepsPerMm(dp);
+    const devZ = deviceVal("102");
+    if (devZ != null && zFull > 0) {
+      const micro = Math.round(devZ / zFull);
+      const curZMicro = dp.zMicrostepping ?? dp.microstepping;
+      if (micro >= 1 && Math.abs(devZ - micro * zFull) <= Math.max(0.01, devZ * 0.005)) {
+        if (micro !== curZMicro) {
+          next.zMicrostepping = micro;
+          changes.push(`Z 细分 ${curZMicro} → ${micro}（$102=${fmtVal(devZ)}）`);
+        }
+      } else {
+        changes.push(`$102=${fmtVal(devZ)} 无法由档案 Z 传动参数整除出细分，请核对导程/齿距`);
+      }
+    }
+    // 速度/加速度：设备实值直接回填（档案字段缺失视为已同步）
+    const vel = { ...dp.firmware?.maxVelocityMmMin };
+    const acc = { ...dp.firmware?.maxAccelMmS2 };
+    for (const [key, axis] of [
+      ["110", "x"],
+      ["111", "y"],
+      ["112", "z"],
+      ["120", "x"],
+      ["121", "y"],
+      ["122", "z"],
+    ] as const) {
+      const v = deviceVal(key);
+      if (v == null) continue;
+      const isVel = Number(key) < 120;
+      const target = isVel ? vel : acc;
+      if (target[axis] !== v) {
+        target[axis] = v;
+        changes.push(`$${key} → ${isVel ? "最大速度" : "最大加速度"} ${axis.toUpperCase()} = ${fmtVal(v)}`);
+      }
+    }
+    if (Object.keys(vel).length > 0 || Object.keys(acc).length > 0) {
+      next.firmware = { ...dp.firmware, maxVelocityMmMin: vel, maxAccelMmS2: acc };
+    }
+    if (changes.length === 0) {
+      alert("设备参数与档案一致，无需同步。");
+      return;
+    }
+    if (!confirm(`将按设备实值更新以下档案项：\n${changes.join("\n")}\n\n继续？`)) return;
+    set(next);
+    setProbe(null);
+  };
+
+  /** 可选一键写入：将档案换算值写入 $100–$102（需用户确认）。 */
+  const writeSuggestions = async (): Promise<void> => {
+    if (!probe) return;
+    const mismatched = probe.comparisons.filter(
+      (c) => ["100", "101", "102"].includes(c.key) && c.match === false && c.suggested != null,
+    );
+    if (mismatched.length === 0) {
+      alert("步/mm（$100–$102）无差异，无需写入。");
+      return;
+    }
+    const lines = mismatched.map(
+      (c) => `$${c.key} = ${fmtVal(c.suggested as number)}（设备当前 ${c.device != null ? fmtVal(c.device) : "—"}）`,
+    );
+    if (
+      !confirm(
+        `将把档案建议值写入设备：\n${lines.join("\n")}\n\n注意：写入后建议重启设备并试绘 10mm 校准方格验证比例。继续？`,
+      )
+    ) {
+      return;
+    }
+    try {
+      const res = await fetch("/grbl/params/write", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          settings: Object.fromEntries(mismatched.map((c) => [c.key, c.suggested as number])),
+        }),
+      });
+      if (!res.ok) {
+        alert(`写入失败：${await res.text()}`);
+        return;
+      }
+      const result = (await res.json()) as { written: string[]; errors: { key: string; message: string }[] };
+      const errText = result.errors.map((e) => `$${e.key}: ${e.message}`).join("；");
+      alert(`已写入：${result.written.map((k) => `$${k}`).join(", ") || "无"}${errText ? `\n失败：${errText}` : ""}`);
+      await readDeviceParams();
+    } catch (e) {
+      alert(`写入请求发送失败：${(e as Error).message}`);
+    }
+  };
+
   return (
     <div>
       <label title="此配置的名称，方便后续识别">
         设备名称
         <input
           type="text"
+          className="center-text"
           value={dp.name}
           onChange={(e) => {
             const v = e.target.value;
@@ -329,6 +526,10 @@ function DriveParams({ state }: { state: State }) {
           }}
         />
       </label>
+      <div className="drive-group-title">
+        传动参数（XY）
+        <span className="drive-group-subtitle">建议值对照 $100/$101</span>
+      </div>
       <div className="flex">
         <label title="步进电机每一步的转角">
           步距角 (&deg;)
@@ -373,12 +574,284 @@ function DriveParams({ state }: { state: State }) {
           />
         </label>
       </div>
+      <div className="drive-params-result">
+        <div className="drive-result-row">
+          <div className="drive-result-label">
+            stepsPerMm
+            <span className="drive-result-sub">（$100/$101 建议）</span>
+          </div>
+          <strong>{stepsPerMm.toFixed(4)}</strong>
+        </div>
+        <div className="drive-result-row">
+          <div className="drive-result-label">微步值</div>
+          <strong>{microstepsPerMm.toFixed(4)}</strong>
+        </div>
+      </div>
+      <div className="drive-group-title">
+        传动参数（Z）与抬笔
+        <span className="drive-group-subtitle">建议值对照 $102</span>
+      </div>
+      <div className="flex">
+        <label title="Z 轴传动形式：丝杆按导程换算，同步带按齿数×齿距换算">
+          Z 传动
+          <select
+            value={zType}
+            onChange={(e) => set({ zDriveType: e.target.value as ZDriveType })}
+          >
+            <option value="screw">丝杆</option>
+            <option value="belt">同步带</option>
+          </select>
+        </label>
+        <label title="Z 轴步进电机步距角，留空沿用 XY 步距角">
+          Z 步距角 (&deg;)
+          <input
+            type="number"
+            value={dp.zStepAngle ?? ""}
+            step="0.1"
+            min="0.1"
+            placeholder={String(dp.stepAngle)}
+            onChange={(e) => set({ zStepAngle: e.target.value === "" ? undefined : Number(e.target.value) })}
+          />
+        </label>
+      </div>
+      {zType === "screw" ? (
+        <div className="flex">
+          <label title="丝杆导程：电机转一圈 Z 轴前进的距离 (mm)，T8 丝杆典型 8">
+            丝杆导程 (mm/rev)
+            <input
+              type="number"
+              value={dp.zLeadMm ?? ""}
+              step="0.5"
+              min="0.1"
+              onChange={(e) => set({ zLeadMm: Number(e.target.value) })}
+            />
+          </label>
+        </div>
+      ) : (
+        <div className="flex">
+          <label title="Z 轴同步轮齿数">
+            Z 同步轮齿数
+            <input
+              type="number"
+              value={dp.zPulleyTeeth ?? ""}
+              step="1"
+              min="1"
+              onChange={(e) => set({ zPulleyTeeth: Number(e.target.value) })}
+            />
+          </label>
+          <label title="Z 轴同步带齿距 (mm)">
+            Z 齿距 (mm)
+            <input
+              type="number"
+              value={dp.zBeltPitch ?? ""}
+              step="0.1"
+              min="0.1"
+              onChange={(e) => set({ zBeltPitch: Number(e.target.value) })}
+            />
+          </label>
+        </div>
+      )}
+      <div className="flex">
+        <label title="落笔时的 Z 高度 (mm)，通常为 0">
+          落笔 Z (mm)
+          <input
+            type="number"
+            value={dp.zPenDownMm ?? 0}
+            step="0.1"
+            onChange={(e) => set({ zPenDownMm: Number(e.target.value) })}
+          />
+        </label>
+        <label title="抬笔时的 Z 高度 (mm)，即抬笔行程">
+          抬笔 Z (mm)
+          <input
+            type="number"
+            value={dp.zPenUpMm ?? 5}
+            step="0.5"
+            min="0.5"
+            onChange={(e) => set({ zPenUpMm: Number(e.target.value) })}
+          />
+        </label>
+        <label className="label-xs" title="Z 轴进给速率 (mm/min)，抬笔/落笔动作的速度">
+          Z 进给 (mm/min)
+          <input
+            type="number"
+            value={dp.zFeedMmMin ?? 600}
+            step="50"
+            min="10"
+            onChange={(e) => set({ zFeedMmMin: Number(e.target.value) })}
+          />
+        </label>
+      </div>
+      <div className="drive-params-result">
+        <div className="drive-result-row">
+          <div className="drive-result-label">
+            Z stepsPerMm
+            <span className="drive-result-sub">（$102 建议）</span>
+          </div>
+          <strong>{zStepsPerMm.toFixed(4)}</strong>
+        </div>
+      </div>
+      <div className="drive-group-title">
+        固件能力
+        <span className="drive-group-subtitle">自动探测 / 手动指定</span>
+      </div>
+      <div className="flex">
+        <label title="固件种类。自动 = 连接时由版本横幅与 $I 探测（grblHAL 可能伪装 Grbl 1.1 横幅，将以 $I 为准）">
+          固件种类
+          <select
+            value={fw.firmwareKind ?? "auto"}
+            onChange={(e) => setFw({ firmwareKind: e.target.value as FirmwareKind })}
+          >
+            <option value="auto">自动探测</option>
+            <option value="grbl-0.9">GRBL 0.9</option>
+            <option value="grbl-1.1">GRBL 1.1</option>
+            <option value="grblhal">grblHAL</option>
+          </select>
+        </label>
+        <label title="串口波特率。GRBL 的波特率为固件编译期属性，连接失败时会按档位轮询重试">
+          波特率
+          <select
+            value={fw.baudRate ?? 115200}
+            onChange={(e) => setFw({ baudRate: Number(e.target.value) as 9600 | 57600 | 115200 | 230400 | 250000 })}
+          >
+            <option value={9600}>9600</option>
+            <option value={57600}>57600</option>
+            <option value={115200}>115200</option>
+            <option value={230400}>230400</option>
+            <option value={250000}>250000</option>
+          </select>
+        </label>
+      </div>
+      <div className="flex">
+        <label title="GRBL 接收缓冲区字节数（默认 128，可调 64–256），用于流式发送的字符计数流控">
+          RX 缓冲 (字节)
+          <input
+            type="number"
+            value={fw.rxBufferSize ?? 128}
+            step="1"
+            min="64"
+            max="256"
+            onChange={(e) => setFw({ rxBufferSize: Number(e.target.value) })}
+          />
+        </label>
+        <label title="$H 归位支持：有限位开关才可开启。自动 = 连接时探测">
+          $H 归位
+          <select
+            value={fw.homingSupport ?? "auto"}
+            onChange={(e) => setFw({ homingSupport: e.target.value as "auto" | "yes" | "no" })}
+          >
+            <option value="auto">自动探测</option>
+            <option value="yes">支持</option>
+            <option value="no">不支持</option>
+          </select>
+        </label>
+        <label title="$10 状态回报格式。0.9 与 1.1 报文不兼容，自动 = 按固件版本推断">
+          状态回报
+          <select
+            value={fw.statusReport ?? "auto"}
+            onChange={(e) => setFw({ statusReport: e.target.value as "auto" | "v0.9" | "v1.1" })}
+          >
+            <option value="auto">自动探测</option>
+            <option value="v0.9">0.9 格式</option>
+            <option value="v1.1">1.1 格式</option>
+          </select>
+        </label>
+      </div>
+      {/* 组头 + X/Y/Z 短标签：三列标签等高单行，输入框同一水平线对齐 */}
+      <div className="field-group-title">最大速度 (mm/min)</div>
+      <div className="flex">
+        <label title="$110 最大 X 速度 (mm/min)，供预计时长估算；可连接后在参数助手「从设备读取」回填">
+          X
+          <input
+            type="number"
+            value={fw.maxVelocityMmMin?.x ?? ""}
+            step="100"
+            min="0"
+            onChange={(e) => setMaxVel("x", e.target.value)}
+          />
+        </label>
+        <label title="$111 最大 Y 速度 (mm/min)">
+          Y
+          <input
+            type="number"
+            value={fw.maxVelocityMmMin?.y ?? ""}
+            step="100"
+            min="0"
+            onChange={(e) => setMaxVel("y", e.target.value)}
+          />
+        </label>
+        <label title="$112 最大 Z 速度 (mm/min)">
+          Z
+          <input
+            type="number"
+            value={fw.maxVelocityMmMin?.z ?? ""}
+            step="100"
+            min="0"
+            onChange={(e) => setMaxVel("z", e.target.value)}
+          />
+        </label>
+      </div>
+      <div className="field-hint">
+        「绘制进给速度」的超限校验与本组上限均以本档案配置值为依据，而非设备实时 $$——设备端手改参数后请用参数助手「从设备读取」回填。
+      </div>
+      <div className="field-group-title">最大加速度 (mm/s²)</div>
+      <div className="flex">
+        <label title="$120 最大 X 加速度 (mm/s²)">
+          X
+          <input
+            type="number"
+            value={fw.maxAccelMmS2?.x ?? ""}
+            step="10"
+            min="0"
+            onChange={(e) => setMaxAccel("x", e.target.value)}
+          />
+        </label>
+        <label title="$121 最大 Y 加速度 (mm/s²)">
+          Y
+          <input
+            type="number"
+            value={fw.maxAccelMmS2?.y ?? ""}
+            step="10"
+            min="0"
+            onChange={(e) => setMaxAccel("y", e.target.value)}
+          />
+        </label>
+        <label title="$122 最大 Z 加速度 (mm/s²)">
+          Z
+          <input
+            type="number"
+            value={fw.maxAccelMmS2?.z ?? ""}
+            step="10"
+            min="0"
+            onChange={(e) => setMaxAccel("z", e.target.value)}
+          />
+        </label>
+      </div>
+      <div className="drive-group-title">
+        坐标系
+        <span className="drive-group-subtitle">机器原点位置与轴方向；预览原点标记与标尺随原点联动</span>
+      </div>
+      <label
+        title="设备 (0,0) 位于纸张的哪个角，由此确定轴方向：原点在左 → +X 指向纸面右方，在右 → 指向左；原点在上 → +Y 指向纸面下方，在下 → 指向纸面上方。排版设置的上下左右始终是屏幕/纸面视觉方位（预览即所得），与该设置无关；绘制/补画/归位/G-code 导出会在执行层自动做坐标映射。"
+      >
+        机器原点位置
+        <select
+          value={dp.originCorner ?? "top-left"}
+          onChange={(e) => set({ originCorner: e.target.value as OriginCorner })}
+        >
+          <option value="top-left">左上（绘图仪惯例）</option>
+          <option value="bottom-left">左下（CNC 惯例）</option>
+          <option value="top-right">右上</option>
+          <option value="bottom-right">右下</option>
+        </select>
+      </label>
+      <div className="drive-group-title">工作区</div>
       <div className="flex">
         <label title="安全工作区域宽度，自原点 0,0 起。用于绘制前超界校验与预览标红，防止撞轴">
           工作区宽 (mm)
           <input
             type="number"
-            value={dp.workingAreaMm?.x ?? ""}
+            value={waText.x}
             step="1"
             min="1"
             onChange={(e) => setWorkingArea("x", e.target.value)}
@@ -388,45 +861,70 @@ function DriveParams({ state }: { state: State }) {
           工作区高 (mm)
           <input
             type="number"
-            value={dp.workingAreaMm?.y ?? ""}
+            value={waText.y}
             step="1"
             min="1"
             onChange={(e) => setWorkingArea("y", e.target.value)}
           />
         </label>
       </div>
-      <div className="drive-params-result">
-        <div className="duration">
-          <div>stepsPerMm</div>
-          <div>
-            <strong>{stepsPerMm.toFixed(4)}</strong>
-          </div>
-        </div>
-        <div className="duration">
-          <div>微步值</div>
-          <div>
-            <strong>{microstepsPerMm.toFixed(4)}</strong>
-          </div>
-        </div>
+      <div className="drive-group-title">
+        参数助手
+        <span className="drive-group-subtitle">设备 $$ 实值对照（GRBL）</span>
       </div>
+      <div className="flex">
+        <button type="button" onClick={() => void readDeviceParams()} disabled={probing}>
+          {probing ? "读取中…" : "读取设备参数"}
+        </button>
+        {probe && (
+          <button type="button" onClick={syncFromDevice} title="以设备 $$ 实值为准回填档案（推荐方向）">
+            反向同步到档案
+          </button>
+        )}
+        {probe && (
+          <button type="button" onClick={() => void writeSuggestions()} title="将档案换算值写入设备 $100–$102（需确认）">
+            写入设备 ($100–$102)
+          </button>
+        )}
+      </div>
+      {probeError && <div className="param-compare-error">{probeError}</div>}
+      {probe && (
+        <div className="param-compare">
+          <div className="param-compare-row param-compare-head">
+            <span>参数</span>
+            <span>项目</span>
+            <span>设备值</span>
+            <span>档案建议</span>
+            <span>状态</span>
+          </div>
+          {probe.comparisons.map((c) => (
+            <div key={c.key} className="param-compare-row">
+              <span>${c.key}</span>
+              <span>
+                {c.label} ({c.unit})
+              </span>
+              <span>{c.device != null ? fmtVal(c.device) : "—"}</span>
+              <span>{c.suggested != null ? fmtVal(c.suggested) : "—"}</span>
+              <span>{c.match == null ? "无法比较" : c.match ? "一致" : "不一致"}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
 
 function PenHeight({ state, driver }: { state: State; driver: BaseDriver }) {
-  const { penUpHeight, penDownHeight, hardware } = state.planOptions;
+  const { penUpHeight, penDownHeight } = state.planOptions;
   const dispatch = useContext(DispatchContext);
   const setPenUpHeight = (x: number) => dispatch({ type: "SET_PLAN_OPTION", value: { penUpHeight: x } });
   const setPenDownHeight = (x: number) => dispatch({ type: "SET_PLAN_OPTION", value: { penDownHeight: x } });
-  const device = getDevice(hardware);
-
+  // 笔位为 pct 口径（0 = 完全抬笔，100 = 完全落笔），GRBL 执行层直接线性映射 Z 高度
   const penUp = () => {
-    const height = device.penPctToPos(penUpHeight);
-    driver.setPenHeight(height, 1000);
+    driver.setPenHeight(penUpHeight, 1000);
   };
   const penDown = () => {
-    const height = device.penPctToPos(penDownHeight);
-    driver.setPenHeight(height, 1000);
+    driver.setPenHeight(penDownHeight, 1000);
   };
   return (
     <Fragment>
@@ -468,27 +966,47 @@ function HardwareOptions({ state, driver }: { state: State; driver: BaseDriver |
   const dispatch = useContext(DispatchContext);
   const [savedProfiles, setSavedProfiles] = React.useState<SavedProfile[]>(() => loadSavedProfiles());
   const refreshProfiles = () => setSavedProfiles(loadSavedProfiles());
+  // 2.7 参数助手：档案变化（编辑/切换预设/反向同步/初始挂载）时全量同步到
+  // 服务端，保证 GRBL 执行层（Z 配置/限速/工作区）与前端档案一致。
+  // 服务端模式经 ws 转发；浏览器直连模式下 changeDriveParams 由驱动直接生效。
+  // send 在未连接时抛错，静默忽略（重连后 effect 不会自动重发，下一次档案
+  // 编辑会补上）。
+  const driveParams = state.planOptions.driveParams;
+  React.useEffect(() => {
+    try {
+      driver?.changeDriveParams(driveParams);
+    } catch (e) {
+      console.warn("[Bit2AtomBot] driveParams sync failed:", e);
+    }
+  }, [driveParams, driver]);
   const handleHardwareChange = (value: string) => {
     if (!value) return;
     if (value === "custom") {
       dispatch({ type: "SET_PLAN_OPTION", value: { hardware: "custom" } });
-    } else if (!isBuiltinHardware(value)) {
+    } else if (GRBL_PRESET_KEYS.includes(value)) {
+      // GRBL 预设模板：以档案值为起点载入 driveParams，可修改后另存为命名档案
+      const preset = GRBL_PRESET_PROFILES.find((p) => p.key === value);
+      if (preset) {
+        dispatch({
+          type: "SET_PLAN_OPTION",
+          value: { hardware: value, driveParams: { ...preset.driveParams, name: "" } },
+        });
+        try {
+          driver?.changeHardware(value as Hardware);
+        } catch (e) {
+          console.warn("[Bit2AtomBot] HW change failed:", e);
+        }
+      }
+    } else {
       const profiles = loadSavedProfiles();
       const profile = profiles.find((p) => p.name === value);
       if (profile) {
         dispatch({ type: "SET_PLAN_OPTION", value: { hardware: value, driveParams: { ...profile.driveParams } } });
       }
-    } else {
-      dispatch({ type: "SET_PLAN_OPTION", value: { hardware: value, driveParams: defaultPlanOptions.driveParams } });
-      try {
-        driver?.changeHardware(value as Hardware);
-      } catch (e) {
-        console.warn("[Bit2AtomBot] HW change failed:", e);
-      }
     }
   };
   const currentHardware = state.planOptions.hardware;
-  const isCustomMode = !isBuiltinHardware(currentHardware);
+  const isCustomMode = !GRBL_PRESET_KEYS.includes(currentHardware);
   const handleSave = () => {
     const dp = state.planOptions.driveParams;
     const name = dp.name.trim();
@@ -517,13 +1035,16 @@ function HardwareOptions({ state, driver }: { state: State; driver: BaseDriver |
   };
   return (
     <div>
-      <label title="硬件型号（影响舵机和电机设置）">
+      <label title="硬件预设（作为自定义档案的起点模板）">
         硬件列表：
         <select value={currentHardware} onChange={(e) => handleHardwareChange(e.target.value)} disabled={false}>
-          <option value="v3">AxiDraw V3</option>
-          <option value="brushless">AxiDraw V3 Brushless</option>
-          <option value="nextdraw-2234">NextDraw 2234</option>
-          <option value="idraw-h-se">iDraw H SE</option>
+          <optgroup label="── GRBL 预设模板 ──">
+            {GRBL_PRESET_PROFILES.map((p) => (
+              <option key={p.key} value={p.key}>
+                {p.label}
+              </option>
+            ))}
+          </optgroup>
           {savedProfiles.map((p) => (
             <option key={p.name} value={p.name}>
               {p.name}
@@ -584,17 +1105,14 @@ function VisualizationOptions({ state }: { state: State }) {
 
 function OriginOptions({ state }: { state: State }) {
   const dispatch = useContext(DispatchContext);
-  const stepsPerMm = !isBuiltinHardware(state.planOptions.hardware)
-    ? computeStepsPerMm(state.planOptions.driveParams)
-    : getDevice(state.planOptions.hardware).stepsPerMm;
   return (
     <div className="flex">
-      <label title="绘图时笔的起始和结束位置 (x)">
+      <label title="绘图时笔的起始和结束位置 (x)，相对机器原点角向纸面内度量（0 = 原点角本身），跟随「机器原点位置」联动">
         起点 x (mm):
         <input
           type="number"
           min="0"
-          max={state.planOptions.paperSize.size.x * stepsPerMm}
+          max={state.planOptions.paperSize.size.x}
           step="10"
           value={state.planOptions.penHome.x}
           onChange={(e) =>
@@ -605,12 +1123,12 @@ function OriginOptions({ state }: { state: State }) {
           }
         />
       </label>
-      <label title="绘图时笔的起始和结束位置 (y)">
+      <label title="绘图时笔的起始和结束位置 (y)，相对机器原点角向纸面内度量（0 = 原点角本身），跟随「机器原点位置」联动">
         起点 y (mm):
         <input
           type="number"
           min="0"
-          max={state.planOptions.paperSize.size.y * stepsPerMm}
+          max={state.planOptions.paperSize.size.y}
           step="10"
           value={state.planOptions.penHome.y}
           onChange={(e) =>
@@ -731,7 +1249,14 @@ function PaperConfig({ state }: { state: State }) {
                   (e.target as HTMLInputElement).value = "0";
                 }
               }}
-              onChange={(e) => dispatch({ type: "SET_PLAN_OPTION", value: { rotateDrawing: Number(e.target.value) } })}
+              onChange={(e) =>
+                dispatch({
+                  type: "SET_PLAN_OPTION",
+                  // 用户主动改旋转角 → 清除导入文件的「最终排版」标记，
+                  // 旋转对本文件恢复生效（否则带标记文件始终所见即所得）
+                  value: { rotateDrawing: Number(e.target.value), bakedRotationDeg: undefined },
+                })
+              }
             />
           </div>
         </label>
@@ -760,11 +1285,8 @@ function MotorControl({ driver }: { driver: BaseDriver }) {
   );
 }
 
-function PlanStatistics({ plan, planOptions: po }: { plan: Plan | null; planOptions: PlanOptions }) {
-  const stepsPerMm = !isBuiltinHardware(po.hardware)
-    ? computeStepsPerMm(po.driveParams)
-    : getDevice(po.hardware).stepsPerMm;
-  const totalDist = plan != null ? plan.totalDistance(stepsPerMm) : 0;
+function PlanStatistics({ plan }: { plan: Plan | null }) {
+  const totalDist = plan != null ? plan.totalDistance() : 0;
   const distStr = totalDist >= 1000 ? `${(totalDist / 1000).toFixed(1)} m` : `${Math.round(totalDist)} mm`;
   return (
     <div className="plan-stats">
@@ -835,19 +1357,21 @@ function PlanPreview({
   plan: Plan | null;
 }) {
   const ps = state.planOptions.paperSize;
-  const stepsPerMm = !isBuiltinHardware(state.planOptions.hardware)
-    ? computeStepsPerMm(state.planOptions.driveParams)
-    : getDevice(state.planOptions.hardware).stepsPerMm;
-  const strokeWidth = state.visualizationOptions.penStrokeWidth * stepsPerMm;
+  // Plan 坐标为毫米口径，预览直接按 mm 渲染（viewBox 单位 = mm）。
+  const strokeWidth = state.visualizationOptions.penStrokeWidth;
   const colorPathsByStrokeOrder = state.visualizationOptions.colorPathsByStrokeOrder;
-  // 设备工作范围（内置硬件才有可信行程）：纸张超出部分以红色标示，
-  // 服务端会拒绝坐标超界的绘制任务
-  const machineAreaMm = isBuiltinHardware(state.planOptions.hardware)
-    ? getDevice(state.planOptions.hardware).workingAreaMm
-    : null;
+  // 设备工作范围（来自 GRBL 档案 workingAreaMm，未配置时不标示）：纸张超出
+  // 部分以红色标示，服务端会拒绝坐标超界的绘制任务
+  const machineAreaMm = state.planOptions.driveParams.workingAreaMm ?? null;
   const paperOutOfBounds =
     machineAreaMm != null &&
     (ps.size.x > machineAreaMm.x + 0.5 || ps.size.y > machineAreaMm.y + 0.5);
+  // 机器原点角（与执行层 applyMachineFrame 同源）：预览图形保持屏幕方位
+  // （物理纸面上图形方向不变），但标尺改为机器坐标读数，并在原点角绘制
+  // (0,0) 标记与 +X/+Y 方向箭头，保证「预览 ↔ 真机绘制」认知一致。
+  const originCorner = state.planOptions.driveParams.originCorner ?? "top-left";
+  const originRight = originCorner.endsWith("right");
+  const originBottom = originCorner.startsWith("bottom");
   const memoizedPlanPreview = useMemo(() => {
     if (plan) {
       const palette = colorPathsByStrokeOrder
@@ -885,15 +1409,15 @@ function PlanPreview({
     const inRanges = (idx: number, ranges: { from: number; to: number }[]) =>
       ranges.some((r) => idx >= r.from && idx < r.to);
     return (
-      <g transform={`scale(${1 / stepsPerMm})`}>
+      <g>
         <title>笔起始点</title>
         <circle
           cx={lines[0][0].x}
           cy={lines[0][0].y}
-          r={stepsPerMm * 1.5}
+          r={1.5}
           fill="#2196F3"
           stroke="#1565C0"
-          strokeWidth={stepsPerMm * 0.3}
+          strokeWidth={0.3}
         />
         {lines.map((line, i) => {
           const motionIdx = linesWithIdx[i].motionIdx;
@@ -958,7 +1482,6 @@ function PlanPreview({
     rewindRange,
     redrawnRanges,
     strokeWidth,
-    stepsPerMm,
   ]);
 
   // w/h of svg.
@@ -1044,8 +1567,8 @@ function PlanPreview({
       motion instanceof XYMotion
         ? motion.instant(Math.min(microprogress / 1000, motion.duration())).p
         : (plan.motion(state.progress - 1) as XYMotion).p2;
-    const posXMm = pos.x / stepsPerMm;
-    const posYMm = pos.y / stepsPerMm;
+    const posXMm = pos.x;
+    const posYMm = pos.y;
     progressIndicator = (
       <svg
         width={width * 2}
@@ -1106,6 +1629,18 @@ function PlanPreview({
   );
   const rulerMarks = useMemo(() => {
     const ticks = [];
+    // 标尺读数口径 = 机器坐标（自原点角起算）：原点在左 → X 值向右递增，
+    // 在右 → 向左递增；原点在上 → Y 值向下递增，在下 → 向上递增。
+    // 刻度位置仍锚定边距框角，读数为该位置的机器坐标（原点 0,0 在纸角，
+    // 由 originMarker 标示）。
+    const xLabel = (mm: number): string => {
+      const v = originRight ? ps.size.x - marginMm - mm : marginMm + mm;
+      return String(Math.round(v * 10) / 10);
+    };
+    const yLabel = (mm: number): string => {
+      const v = originBottom ? ps.size.y - marginMm - mm : marginMm + mm;
+      return String(Math.round(v * 10) / 10);
+    };
     const maxDim = Math.max(drawW, drawH);
     for (let mm = 0; mm <= maxDim; mm += 5) {
       const is10 = mm % 10 === 0;
@@ -1132,7 +1667,7 @@ function PlanPreview({
               fontSize="2.2"
               textAnchor="middle"
               fill="var(--canvas-ruler-text)"
-            >{`${mm}`}</text>,
+            >{xLabel(mm)}</text>,
           );
       }
       if (mm <= drawW) {
@@ -1156,7 +1691,7 @@ function PlanPreview({
               fontSize="2.2"
               textAnchor="middle"
               fill="var(--canvas-ruler-text)"
-            >{`${mm}`}</text>,
+            >{xLabel(mm)}</text>,
           );
       }
       if (mm <= drawH) {
@@ -1180,7 +1715,7 @@ function PlanPreview({
               fontSize="2.2"
               textAnchor="end"
               fill="var(--canvas-ruler-text)"
-            >{`${mm}`}</text>,
+            >{yLabel(mm)}</text>,
           );
       }
       if (mm <= drawH) {
@@ -1204,12 +1739,77 @@ function PlanPreview({
               fontSize="2.2"
               textAnchor="start"
               fill="var(--canvas-ruler-text)"
-            >{`${mm}`}</text>,
+            >{yLabel(mm)}</text>,
           );
       }
     }
     return ticks;
-  }, [marginMm, drawW, drawH]);
+  }, [marginMm, drawW, drawH, originRight, originBottom, ps.size.x, ps.size.y]);
+  // 机器原点标记：原点角处绘制 (0,0) 十字圈与 +X/+Y 方向箭头（指向纸面内），
+  // 随「机器原点位置」下拉实时联动，与执行层 applyMachineFrame 的轴方向一致。
+  const originAx = originRight ? -1 : 1;
+  const originAy = originBottom ? -1 : 1;
+  const originX = originRight ? ps.size.x : 0;
+  const originY = originBottom ? ps.size.y : 0;
+  const axisLen = 14;
+  const originMarker = (
+    <g>
+      <title>机器原点 (0,0)</title>
+      {/* +X 轴：原点在左 → 指向纸面右方；在右 → 指向左 */}
+      <line
+        x1={originX}
+        y1={originY}
+        x2={originX + originAx * axisLen}
+        y2={originY}
+        stroke="var(--canvas-origin)"
+        strokeWidth={0.5}
+      />
+      <path
+        d={`M${originX + originAx * (axisLen + 2)} ${originY}l${-originAx * 2.5} -1.2l0 2.4z`}
+        fill="var(--canvas-origin)"
+      />
+      <text
+        x={originX + originAx * (axisLen + 3.5)}
+        y={originY + originAy * 3 + 1}
+        fontSize="2.6"
+        fontWeight="700"
+        textAnchor={originAx === 1 ? "start" : "end"}
+        fill="var(--canvas-origin)"
+      >+X</text>
+      {/* +Y 轴：原点在上 → 指向纸面下方；在下 → 指向上方 */}
+      <line
+        x1={originX}
+        y1={originY}
+        x2={originX}
+        y2={originY + originAy * axisLen}
+        stroke="var(--canvas-origin)"
+        strokeWidth={0.5}
+      />
+      <path
+        d={`M${originX} ${originY + originAy * (axisLen + 2)}l-1.2 ${-originAy * 2.5}l2.4 0z`}
+        fill="var(--canvas-origin)"
+      />
+      <text
+        x={originX + originAx * 2}
+        y={originY + originAy * (axisLen + 3)}
+        fontSize="2.6"
+        fontWeight="700"
+        textAnchor={originAx === 1 ? "start" : "end"}
+        dominantBaseline="middle"
+        fill="var(--canvas-origin)"
+      >+Y</text>
+      {/* 原点圈 + 坐标文字 */}
+      <circle cx={originX} cy={originY} r={1.4} fill="none" stroke="var(--canvas-origin)" strokeWidth={0.45} />
+      <text
+        x={originX + originAx * 3.5}
+        y={originY + originAy * 7.5}
+        fontSize="2.6"
+        textAnchor={originAx === 1 ? "start" : "end"}
+        dominantBaseline={originAy === 1 ? "hanging" : "auto"}
+        fill="var(--canvas-origin)"
+      >0,0</text>
+    </g>
+  );
   return (
     <div className="preview">
       <svg
@@ -1252,6 +1852,7 @@ function PlanPreview({
         {gridDefs}
         {gridRects}
         {rulerMarks}
+        {originMarker}
         {renderedPlanPreview}
         {margins}
       </svg>
@@ -1325,6 +1926,20 @@ function LayerSelector({ state }: { state: State }) {
   );
 }
 
+// 机器坐标系映射：屏幕坐标（预览/排版口径，原点在纸面左上）→ 机器坐标。
+// 原点角来自硬件档案（缺省左上 = 恒等映射）。绘制/补画/归位/G-code 导出
+// 统一在发送前应用；预览、统计、补画区间索引仍全部工作在屏幕空间。
+// 模块级共享：PlotButtons（绘制/补画/归位）与 Root（G-code 导出）都需要；
+// 此前定义为 PlotButtons 私有函数，Root 的导出处理器引用不到，esbuild 构建
+// 无类型检查放行，运行时抛 ReferenceError——表现为导出 G-code「无反馈」。
+function machineFramePlan(
+  p: Plan,
+  originCorner: OriginCorner | undefined,
+  paperSizeMm: { x: number; y: number },
+): Plan {
+  return applyMachineFrame(p, originCorner ?? "top-left", paperSizeMm);
+}
+
 function PlotButtons({
   state,
   plan,
@@ -1365,18 +1980,15 @@ function PlotButtons({
           ? [...state.planOptions.selectedGroupLayers].sort()
           : [...state.planOptions.selectedStrokeLayers].sort(),
     };
-    // 计划坐标处于全步进空间（mm×stepsPerMm），服务端换算真实距离需要该密度
-    driver.plotStepsPerMm = isBuiltinHardware(state.planOptions.hardware)
-      ? getDevice(state.planOptions.hardware).stepsPerMm
-      : computeStepsPerMm(state.planOptions.driveParams);
-    // custom 硬件的安全工作区域随请求头传给服务端做超界校验
+    // custom 硬件的安全工作区域随请求头传给服务端做超界校验（服务端亦从
+    // ws changeDriveParams 同步的档案中读取，双保险）
     driver.plotWorkingAreaMm = state.planOptions.driveParams.workingAreaMm ?? null;
     dispatch({ type: "SET_REWIND_RANGE", value: null });
     dispatch({ type: "SET_REDRAWN_RANGES", value: [] });
     dispatch({ type: "SET_REDRAW_MODE", value: false });
     // 新一次绘制从头开始，清除上一轮的已绘制水位线
     dispatch({ type: "SET_DRAWN_WATERMARK", value: null });
-    driver.plot(plan);
+    driver.plot(machineFramePlan(plan, state.planOptions.driveParams.originCorner, state.planOptions.paperSize.size));
   }
 
   // --- 暂停回溯重绘 ---
@@ -1491,7 +2103,11 @@ function PlotButtons({
       value: [...(state.redrawnRanges ?? []), redrawMotionRange(redrawG0, redrawG1)],
     });
     try {
-      const r = driver.redraw(plan, groupStarts[redrawG0], groupEnd(redrawG1)) as unknown;
+      const r = driver.redraw(
+        machineFramePlan(plan, state.planOptions.driveParams.originCorner, state.planOptions.paperSize.size),
+        groupStarts[redrawG0],
+        groupEnd(redrawG1),
+      ) as unknown;
       if (r instanceof Promise) {
         r.catch((e: unknown) => alert(`补画失败：${e instanceof Error ? e.message : String(e)}`));
       }
@@ -1502,12 +2118,20 @@ function PlotButtons({
   const homePen = () => {
     // 抬笔回原点：位置未知（如服务重启）时恢复已知笔位置，供补画使用
     try {
-      const r = driver.homePen(plan) as unknown;
+      const r = driver.homePen(
+        plan ? machineFramePlan(plan, state.planOptions.driveParams.originCorner, state.planOptions.paperSize.size) : null,
+      ) as unknown;
       if (r instanceof Promise) {
         r.catch((e: unknown) => alert(`笔回原点失败：${e instanceof Error ? e.message : String(e)}`));
       }
     } catch (e) {
       alert(`笔回原点失败：${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+  const unlockDevice = () => {
+    // 3.5 解锁设备（$X）：Alarm 且无法归位时的最后手段（仅服务端 GRBL 支持）
+    if (confirm("解锁（$X）会丢失位置参考，解锁后须先「笔回原点」才能补画。确定解锁？")) {
+      driver.unlockDevice();
     }
   };
 
@@ -1582,13 +2206,14 @@ function PlotButtons({
         {!state.isSimulating ? (
           <button
             type="button"
+            className="btn-blue"
             onClick={() => plan && simulate(plan)}
             disabled={plan == null || state.progress != null || state.isSimulating}
           >
             模拟绘制
           </button>
         ) : (
-          <button type="button" onClick={stopSimulate}>
+          <button type="button" className="btn-red" onClick={stopSimulate}>
             停止模拟
           </button>
         )}
@@ -1651,17 +2276,24 @@ function PlotButtons({
         </div>
       )}
       {state.progress == null && !state.isSimulating && plan && groupCount > 0 && !state.redrawMode && (
-        <div className="button-row">
-          <button type="button" onClick={enterRedrawMode}>
-            补画模式…
-          </button>
-          <button
-            type="button"
-            onClick={homePen}
-            title="抬笔回到起始点。补画前若笔位置未知（如服务重启过），请先执行此项"
-          >
-            笔回原点
-          </button>
+        <div className="button-column">
+          <button type="button" className="btn-blue" onClick={enterRedrawMode}>补画模式…</button>
+          <div className="button-row">
+            <button
+              type="button"
+              onClick={homePen}
+              title="抬笔回到起始点。补画前若笔位置未知（如服务重启过），请先执行此项"
+            >
+              笔回原点
+            </button>
+            <button
+              type="button"
+              onClick={unlockDevice}
+              title="解除 Alarm 锁定（$X）。仅服务端 GRBL 驱动支持；会丢失位置参考，解锁后须重新归位"
+            >
+              解锁设备
+            </button>
+          </div>
         </div>
       )}
       {state.redrawMode && state.progress == null && !state.isSimulating && groupCount > 0 && (
@@ -1696,20 +2328,27 @@ function PlotButtons({
             />
             <span className="rewind-slider-label">第 {redrawG1 + 1} 条</span>
           </div>
-          <div className="button-row">
-            <button type="button" className="cancel-button cancel-button--active" onClick={startRedraw}>
+          <div className="button-column">
+            <button type="button" className="btn-red" onClick={startRedraw}>
               补画选中区间
             </button>
-            <button
-              type="button"
-              onClick={homePen}
-              title="抬笔回到起始点。补画前若笔位置未知（如服务重启过），请先执行此项"
-            >
-              笔回原点
-            </button>
-            <button type="button" onClick={exitRedrawMode}>
-              退出补画
-            </button>
+            <div className="button-row">
+              <button
+                type="button"
+                onClick={homePen}
+                title="抬笔回到起始点。补画前若笔位置未知（如服务重启过），请先执行此项"
+              >
+                笔回原点
+              </button>
+              <button
+                type="button"
+                onClick={unlockDevice}
+                title="解除 Alarm 锁定（$X）。仅服务端 GRBL 驱动支持；会丢失位置参考，解锁后须重新归位"
+              >
+                解锁设备
+              </button>
+            </div>
+            <button type="button" onClick={exitRedrawMode}>退出补画</button>
           </div>
         </div>
       )}
@@ -1726,7 +2365,7 @@ function ResetToDefaultsButton() {
   };
 
   return (
-    <button type="reset" className="button-link" onClick={onClick}>
+    <button type="reset" onClick={onClick}>
       重置所有选项
     </button>
   );
@@ -1856,6 +2495,15 @@ function ScaleModeConfig({ state }: { state: State }) {
 }
 
 function PlanConfig({ state }: { state: State }) {
+  // 绘制进给速度与设备 $110/$111 的联动校验：进给（×60 → mm/min）超过
+  // 设备 XY 最大速度最小值时，转译层会静默钳制（gcode.ts），此处显式提示
+  const xyMaxVel = state.planOptions.driveParams.firmware?.maxVelocityMmMin;
+  const xyCapMmMinList = [xyMaxVel?.x, xyMaxVel?.y].filter((v): v is number => v != null && v > 0);
+  const xyCapMmMin = xyCapMmMinList.length > 0 ? Math.min(...xyCapMmMinList) : null;
+  // 取整消除浮点噪声（0.1×60 = 6.000000000000001）；比较加 1e-6 容差，
+  // 避免 16.666…×60 = 1000.0000000000001 这类恰等于上限的值被误报超限
+  const feedMmMin = Math.round(state.planOptions.penDownMaxVelocity * 60 * 1000) / 1000;
+  const feedClamped = xyCapMmMin != null && feedMmMin > xyCapMmMin + 1e-6;
   const dispatch = useContext(DispatchContext);
   return (
     <div>
@@ -1924,32 +2572,42 @@ function PlanConfig({ state }: { state: State }) {
             }
           />
         </label>
-        <div className="flex">
-          <label title="落笔时的加速度 (mm/s²)">
-            落下加速度 (mm/s<sup>2</sup>)
-            <input
-              type="number"
-              value={state.planOptions.penDownAcceleration}
-              step="0.1"
-              min="0"
-              onChange={(e) =>
-                dispatch({ type: "SET_PLAN_OPTION", value: { penDownAcceleration: Number(e.target.value) } })
-              }
-            />
-          </label>
-          <label title="落笔时的最大速度 (mm/s)">
-            落下最大速度 (mm/s)
-            <input
-              type="number"
-              value={state.planOptions.penDownMaxVelocity}
-              step="0.1"
-              min="0"
-              onChange={(e) =>
-                dispatch({ type: "SET_PLAN_OPTION", value: { penDownMaxVelocity: Number(e.target.value) } })
-              }
-            />
-          </label>
+        {/* 组标题独立一行 + 单行短标签，保证两列输入框同一水平线对齐 */}
+        {/* 绘制进给速度：真正的执行参数（生成绘制段 G1 的 F 进给值），与下方
+         * 仅用于时长估算的落笔/抬笔参数明确区分。 */}
+        <label
+          title="落笔绘制时的进给速度 (mm/s)：主机按它计算每个绘制段 G1 的 F 值（受 $110/$111 最大速度钳制）。属绘制作业参数而非固件 $ 参数，参数助手读不到它。"
+        >
+          绘制进给速度 (mm/s)
+          <input
+            type="number"
+            value={state.planOptions.penDownMaxVelocity}
+            step="5"
+            min="0"
+            onChange={(e) =>
+              dispatch({ type: "SET_PLAN_OPTION", value: { penDownMaxVelocity: Number(e.target.value) } })
+            }
+          />
+        </label>
+        <div className={feedClamped ? "field-hint field-hint--warn" : "field-hint"}>
+          {feedClamped
+            ? `进给 ${feedMmMin} mm/min 超过设备 $110/$111 最小上限 ${xyCapMmMin} mm/min，实际将按 ${xyCapMmMin} 执行。`
+            : `落笔绘制段 G1 的 F 进给值来源（${feedMmMin} mm/min，受 $110/$111 钳制）；绘制作业参数，非固件 $ 参数。`}
         </div>
+        <div className="field-group-title">落笔参数（仅估算）</div>
+        <div className="field-hint">仅用于主机预计时长估算，实际加减速由设备 $120/$121 决定。</div>
+        <label title="落笔时的加速度 (mm/s²)，仅用于主机预计时长估算">
+          落笔加速度 (mm/s²)
+          <input
+            type="number"
+            value={state.planOptions.penDownAcceleration}
+            step="0.1"
+            min="0"
+            onChange={(e) =>
+              dispatch({ type: "SET_PLAN_OPTION", value: { penDownAcceleration: Number(e.target.value) } })
+            }
+          />
+        </label>
         <label>
           转弯系数
           <input
@@ -1962,9 +2620,14 @@ function PlanConfig({ state }: { state: State }) {
             }
           />
         </label>
+        <div className="field-group-title">抬笔参数（仅估算）</div>
+        <div className="field-hint">
+          抬笔空程以 G0 执行，速度由设备 $110/$111 最大速率决定，本组仅用于主机预计时长估算；抬笔/落笔耗时的实际 Z
+          轴速度由设备配置的「Z 进给」决定。
+        </div>
         <div className="flex">
           <label title="抬笔时的加速度 (mm/s²)">
-            抬起加速度 (mm/s<sup>2</sup>)
+            加速度 (mm/s²)
             <input
               type="number"
               value={state.planOptions.penUpAcceleration}
@@ -1976,7 +2639,7 @@ function PlanConfig({ state }: { state: State }) {
             />
           </label>
           <label title="抬笔时的最大速度 (mm/s)">
-            抬起最大速度 (mm/s)
+            最大速度 (mm/s)
             <input
               type="number"
               value={state.planOptions.penUpMaxVelocity}
@@ -2022,10 +2685,9 @@ function PlanConfig({ state }: { state: State }) {
 type PortSelectorProps = {
   driver: BaseDriver | null;
   setDriver: (driver: BaseDriver) => void;
-  hardware: Hardware;
 };
 
-function PortSelector({ driver, setDriver, hardware }: PortSelectorProps) {
+function PortSelector({ driver, setDriver }: PortSelectorProps) {
   const [initializing, setInitializing] = useState(false);
   const connectingRef = useRef(false);
   // biome-ignore lint/correctness/useExhaustiveDependencies: setDriver is stable
@@ -2040,7 +2702,7 @@ function PortSelector({ driver, setDriver, hardware }: PortSelectorProps) {
         const port = ports[0];
         if (port) {
           console.log("connecting to", port);
-          setDriver(await WebSerialDriver.connect(port, hardware));
+          setDriver(await WebSerialDriver.connect(port));
         }
       } catch (e) {
         console.error("Auto-reconnect failed:", e);
@@ -2049,7 +2711,7 @@ function PortSelector({ driver, setDriver, hardware }: PortSelectorProps) {
         connectingRef.current = false;
       }
     })();
-  }, [driver, hardware]);
+  }, [driver]);
   return (
     <>
       {driver?.connected ? `已连接到 ${driver.name()}` : null}
@@ -2059,10 +2721,10 @@ function PortSelector({ driver, setDriver, hardware }: PortSelectorProps) {
         onClick={async () => {
           setInitializing(true);
           try {
-            const port = await navigator.serial.requestPort({
-              filters: [{ usbVendorId: 0x04d8, usbProductId: 0xfd92 }],
-            });
-            setDriver(await WebSerialDriver.connect(port, hardware));
+            // GRBL 设备 VID/PID 多样（Arduino 兼容板、grblHAL 板卡等），
+            // 不设过滤，由用户在授权弹窗中选择目标设备。
+            const port = await navigator.serial.requestPort();
+            setDriver(await WebSerialDriver.connect(port));
           } catch (e) {
             alert(`Failed to connect to serial device: ${e.message}`);
             console.error(e);
@@ -2159,6 +2821,59 @@ function Root() {
       }
 
       const reader = new FileReader();
+      reader.onerror = () => {
+        setIsLoadingFile(false);
+      };
+      if (/\.(gcode|nc|tap|ngc)$/i.test(file.name)) {
+        // G-code 导入（3.8）：解析为标准 Plan 直接进入管线（预览/回溯/补画/
+        // 超界校验/任务日志复用）。笔位空间为 pct 口径，与当前 UI 档案一致。
+        reader.onload = () => {
+          try {
+            const po = state.planOptions;
+            const result = parseGcode(reader.result as string, {
+              penUpPos: po.penUpHeight,
+              penDownPos: po.penDownHeight,
+              penDownProfile: {
+                acceleration: po.penDownAcceleration,
+                maximumVelocity: po.penDownMaxVelocity,
+                corneringFactor: po.penDownCorneringFactor,
+              },
+              penUpProfile: {
+                acceleration: po.penUpAcceleration,
+                maximumVelocity: po.penUpMaxVelocity,
+                corneringFactor: 0,
+              },
+              penDropDuration: po.penDropDuration,
+              penLiftDuration: po.penLiftDuration,
+              penHome: { ...po.penHome },
+            });
+            const paths: Path[] = result.strokes.map((s) => ({
+              points: s.points.map((p) => machineFramePoint(p, po.driveParams.originCorner ?? "top-left", po.paperSize.size)),
+              stroke: "black",
+              groupId: "",
+              fill: "none",
+              fillRule: "nonzero",
+              groupOrder: 0,
+            }));
+            // 笔画走 paths→replan 正常管线（与 SVG 导入同一条路）：旋转/
+            // 对齐/缩放等排版操作由此生效。此前直接 setPlan 绕过 replan，
+            // 排版参数对 G-code 导入完全无效。坐标为机器坐标（毫米），按
+            // 当前原点角逐点镜像回屏幕空间（镜像变换自逆）；mmPerSvgUnit
+            // = 1（G-code 坐标即毫米）。
+            dispatch(setPaths(paths, 1));
+            // 导入统计：告警行不静默丢弃，完整明细在控制台
+            console.log(`[gcode-import] ${file.name}:`, result.stats, result.warnings);
+            const summary = `导入完成：${result.strokes.length} 条笔画、${result.stats.arcs} 段圆弧、${result.warnings.length} 行告警跳过`;
+            alert(result.warnings.length > 0 ? `${summary}（明细见浏览器控制台）` : summary);
+          } catch (e) {
+            console.error("Failed to import G-code:", e);
+            alert(`G-code 导入失败：${e instanceof Error ? e.message : String(e)}`);
+          }
+          setIsLoadingFile(false);
+        };
+        reader.readAsText(file);
+        return;
+      }
       reader.onload = () => {
         try {
           const { paths, mmPerSvgUnit } = readSvg(reader.result as string);
@@ -2169,12 +2884,9 @@ function Root() {
         }
         setIsLoadingFile(false);
       };
-      reader.onerror = () => {
-        setIsLoadingFile(false);
-      };
       reader.readAsText(file);
     },
-    [setPlan, driver],
+    [setPlan, driver, state.planOptions],
   );
   const handleClear = React.useCallback(() => {
     setPlan(null);
@@ -2184,19 +2896,37 @@ function Root() {
     }
     dispatch({ type: "CLEAR_PATHS" });
   }, [setPlan, driver]);
+  // 导出文件基名：沿用源文件名（对齐任务日志命名惯例）；无源文件回退 export。
+  // try/catch 把导出异常转为显式弹窗——此前异常只在控制台留痕，表现为「点击无任何反馈」。
   const handleExportSvg = React.useCallback(() => {
     if (!plan) return;
-    const stepsPerMm = !isBuiltinHardware(state.planOptions.hardware)
-      ? computeStepsPerMm(state.planOptions.driveParams)
-      : getDevice(state.planOptions.hardware).stepsPerMm;
-    const svg = planToSvg(plan, stepsPerMm, state.planOptions.paperSize);
-    const blob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "export.svg";
-    a.click();
-    URL.revokeObjectURL(url);
+    try {
+      const base = (svgFileNameRef.current ?? "export").replace(/\.[^.]+$/, "");
+      // 根节点写入 data-b2a-rotate-deg 标记（值为当前旋转设置）：本文件是
+      // 最终排版结果，重导入时不再施加任何旋转（所见即所得），旋转不随
+      // 导出/导入循环叠加。用户修改「旋转角度」时标记会被清除、旋转恢复生效。
+      const svg = planToSvg(plan, state.planOptions.paperSize, state.planOptions.rotateDrawing);
+      downloadText(svg, "image/svg+xml;charset=utf-8", `${base}-export.svg`);
+    } catch (err) {
+      alert(`导出 SVG 失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, [plan, state.planOptions]);
+  const handleExportGCode = React.useCallback(() => {
+    if (!plan) return;
+    try {
+      const base = (svgFileNameRef.current ?? "export").replace(/\.[^.]+$/, "");
+      const gcode = planToGCode(
+        machineFramePlan(plan, state.planOptions.driveParams.originCorner, state.planOptions.paperSize.size),
+        {
+          sourceFileName: svgFileNameRef.current,
+          driveParams: state.planOptions.driveParams,
+          hardwareLabel: state.planOptions.hardware,
+        },
+      );
+      downloadText(gcode, "text/plain;charset=utf-8", `${base}-export.gcode`);
+    } catch (err) {
+      alert(`导出 G-code 失败：${err instanceof Error ? err.message : String(err)}`);
+    }
   }, [plan, state.planOptions]);
   const [theme, setTheme] = React.useState<"light" | "dark">(
     () => (window.localStorage.getItem("bit2atom-theme") as "light" | "dark") || "light",
@@ -2224,8 +2954,8 @@ function Root() {
     };
     const onpaste = (e: ClipboardEvent) => {
       e.clipboardData?.items[0].getAsString((s) => {
-        const { paths, mmPerSvgUnit } = readSvg(s);
-        dispatch(setPaths(paths, mmPerSvgUnit));
+        const { paths, mmPerSvgUnit, bakedRotationDeg } = readSvg(s);
+        dispatch(setPaths(paths, mmPerSvgUnit, bakedRotationDeg));
       });
     };
     document.body.addEventListener("drop", ondrop);
@@ -2261,25 +2991,29 @@ function Root() {
             <div className={state.connected && state.deviceInfo?.path ? "info" : "info-disconnected"}>
               {state.connected
                 ? state.deviceInfo?.path
-                  ? `已连接到 EBB (${state.deviceInfo.path})`
-                  : "未连接到 EBB"
+                  ? `已连接到 GRBL (${state.deviceInfo.path})`
+                  : "未连接到 GRBL 设备"
                 : "未连接"}
             </div>
           )}
           {IS_WEB && (
             <div className="section-body">
-              <PortSelector
-                driver={driver}
-                setDriver={setDriver}
-                hardware={(driver as WebSerialDriver)?.ebb?.hardware ?? (state.planOptions.hardware as Hardware)}
-              />
+              <PortSelector driver={driver} setDriver={setDriver} />
             </div>
           )}
           <div className="section-header">画笔设置</div>
           <div className="section-body">
             <PenHeight state={state} driver={driver} />
             <MotorControl driver={driver} />
-            <HardwareOptions state={state} driver={driver} />
+            {/* 机器参数配置（硬件档案/传动参数/固件能力/坐标系/参数助手）
+             * 收纳进可折叠面板：默认收起保持 UI 简洁，且避免误改参数。
+             * 行为与「更多绘制配置」的 details/summary 一致。 */}
+            <details className="device-config">
+              <summary className="section-header">更多设备配置</summary>
+              <div className="device-config-body">
+                <HardwareOptions state={state} driver={driver} />
+              </div>
+            </details>
             <ResetToDefaultsButton />
           </div>
           <div className="section-header">纸张设置</div>
@@ -2293,7 +3027,7 @@ function Root() {
             <ScaleModeConfig state={state} />
           </div>
           <details>
-            <summary className="section-header">更多设置</summary>
+            <summary className="section-header">更多绘制配置</summary>
             <div className="section-body">
               <PlanConfig state={state} />
               <OriginOptions state={state} />
@@ -2311,11 +3045,10 @@ function Root() {
               </label>
             </div>
           </details>
-          <div className="spacer" />
           <div className="control-panel-bottom">
             <div className="section-header">绘图设置</div>
             <div className="section-body section-body__plot">
-              <PlanStatistics plan={plan} planOptions={state.planOptions} />
+              <PlanStatistics plan={plan} />
               <TimeLeft
                 plan={plan}
                 progress={state.progress}
@@ -2323,9 +3056,14 @@ function Root() {
                 paused={state.paused}
               />
               {plan && !state.isSimulating && (
-                <button type="button" className="export-svg-btn" onClick={handleExportSvg}>
-                  导出 SVG
-                </button>
+                <div className="button-row">
+                  <button type="button" className="export-svg-btn" onClick={handleExportSvg}>
+                    导出 SVG
+                  </button>
+                  <button type="button" className="export-svg-btn" onClick={handleExportGCode}>
+                    导出 G-code
+                  </button>
+                </div>
               )}
               <PlotButtons plan={plan} isPlanning={isPlanning} state={state} driver={driver} />
             </div>
@@ -2339,9 +3077,9 @@ function Root() {
           />
           <PlanLoader isPlanning={isPlanning} isLoadingFile={isLoadingFile} />
           {showDragTarget && <DragTarget handleFile={handleFile} />}
-          {state.paths && state.paths.length > 0 && (
+          {(plan != null || (state.paths && state.paths.length > 0)) && (
             <button type="button" className="clear-svg-btn" onClick={handleClear}>
-              清除 SVG
+              清除文件
             </button>
           )}
         </div>
@@ -2364,15 +3102,15 @@ function DragTarget({ handleFile }: { handleFile: (file: File) => void }) {
   return (
     <div className="drag-target">
       <div className="drag-target-message">
-        <span>将 SVG 拖拽至此，或</span>
+        <span>将 SVG / G-code 拖拽至此，或</span>
         <button type="button" onClick={() => fileInputRef.current.click()}>
-          Upload SVG
+          Upload SVG / G-code
         </button>{" "}
         {/* the input for the system file picker can't be styled, so hide it and use this button*/}
         <input
           ref={fileInputRef}
           type="file"
-          accept=".svg"
+          accept=".svg,.gcode,.nc,.tap,.ngc"
           style={{ display: "none" }}
           onChange={handleFileInputChange}
         />
@@ -2383,13 +3121,28 @@ function DragTarget({ handleFile }: { handleFile: (file: File) => void }) {
 
 createRoot(document.getElementById("app")!).render(<Root />);
 
+/** 文本下载（导出 SVG / G-code 共用） */
+function downloadText(text: string, mime: string, fileName: string): void {
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 /**
  * Read an SVG string and transform it to a list of Path.
  * @param svgString Raw SVG String
  * @returns The flattened paths, plus the SVG-unit→mm scale inferred from the
  * root element's width (undefined → fall back to the 96dpi default).
  */
-function readSvg(svgString: string): { paths: Path[]; mmPerSvgUnit: number | undefined } {
+function readSvg(svgString: string): {
+  paths: Path[];
+  mmPerSvgUnit: number | undefined;
+  bakedRotationDeg: number | undefined;
+} {
   const parser = new DOMParser();
   const doc = parser.parseFromString(svgString, "image/svg+xml");
   const svg = doc.querySelector("svg");
@@ -2454,8 +3207,17 @@ function readSvg(svgString: string): { paths: Path[]; mmPerSvgUnit: number | und
   }
   // 导入时推算用户单位→mm 的换算系数（width 带绝对物理单位或 px 数与
   // viewBox 不一致时非 96dpi，按 width_mm ÷ viewBox 宽还原真实尺寸；
-  // width="100%"/缺失时为 undefined，规划时回退 96dpi 缺省值）
-  return { paths, mmPerSvgUnit: mmPerSvgUnitFromSvg(svg) };
+  // width="100%"/缺失时为 undefined，规划时回退 96dpi 缺省值）。
+  // 同时识别本应用导出的文件（根节点 data-b2a-rotate-deg 标记；外部文件
+  // 无此属性 → undefined）：带标记的文件重导入时不再施加「旋转绘制」，
+  // 保证导出→再导入所见即所得、旋转不随往返循环叠加。
+  return {
+    paths,
+    mmPerSvgUnit: mmPerSvgUnitFromSvg(svg),
+    bakedRotationDeg: svg.hasAttribute("data-b2a-rotate-deg")
+      ? Number(svg.getAttribute("data-b2a-rotate-deg")) || 0
+      : undefined,
+  };
 }
 
 // --- Full SVG transform support --------------------------------------------

@@ -7,11 +7,10 @@ import { flattenSVG } from "flatten-svg";
 import { Window } from "svgdom";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
-import type { Hardware } from "./ebb.js";
 import { replan } from "./massager.js";
 import { PaperSize } from "./paper-size.js";
-import { defaultPlanOptions, getDevice, type PlanOptions } from "./planning.js";
-import { connectEBB, startServer } from "./server.js";
+import { defaultPlanOptions, type PlanOptions } from "./planning.js";
+import { connectGrblDevice, startServer, type DriverKind } from "./server.js";
 import { formatDuration, mmPerSvgUnitFromSvg } from "./util.js";
 
 function parseSvg(svg: string) {
@@ -27,16 +26,16 @@ function parseSvg(svg: string) {
 export function cli(argv: string[]): void {
   yargs(hideBin(process.argv))
     .strict()
-    .option("hardware", {
-      describe: "select hardware type",
-      choices: ["v3", "brushless", "nextdraw-2234", "idraw-h-se", "custom"] as const,
-      default: "v3",
-      coerce: (value) => value as Hardware,
-    })
     .option("device", {
       alias: "d",
       describe: "device to connect to",
       type: "string",
+    })
+    .option("driver", {
+      describe: "device driver: grbl = GRBL firmware, sim = virtual GRBL device",
+      choices: ["grbl", "sim"] as const,
+      default: "grbl",
+      coerce: (value) => value as DriverKind,
     })
     .command(
       "plot <file>",
@@ -184,10 +183,11 @@ export function cli(argv: string[]): void {
             ? args["paper-size"].portrait
             : args["paper-size"];
         const planOptions: PlanOptions = {
+          ...defaultPlanOptions,
           driveParams: defaultPlanOptions.driveParams,
           paperSize,
           marginMm: args.margin,
-          hardware: args.hardware,
+          hardware: defaultPlanOptions.hardware,
           penHome: { x: 0, y: 0 },
 
           selectedGroupLayers: new Set([]), // TODO
@@ -226,16 +226,16 @@ export function cli(argv: string[]): void {
         const p = replan(lines, planOptions);
         console.log(`${p.motions.length} motions, estimated duration: ${formatDuration(p.duration())}`);
         console.log("connecting to plotter...");
-        const ebb = await connectEBB(args.hardware, args.device);
-        if (!ebb) {
+        const dev = await connectGrblDevice(args.driver === "sim", args.device || undefined);
+        if (!dev) {
           console.error("Couldn't connect to device!");
           process.exit(1);
         }
         console.log("plotting...");
         const startTime = Date.now();
-        await ebb.executePlan(p);
+        await dev.executePlan(p);
         console.log(`done! took ${formatDuration((Date.now() - startTime) / 1000)}`);
-        await ebb.close();
+        await dev.close();
       },
     )
     .command(
@@ -251,21 +251,20 @@ export function cli(argv: string[]): void {
           .check((args) => args.percent >= 0 && args.percent <= 100),
       async (args) => {
         console.log("connecting to plotter...");
-        const ebb = await connectEBB(args.hardware, args.device);
-        if (!ebb) {
+        const dev = await connectGrblDevice(args.driver === "sim", args.device || undefined);
+        if (!dev) {
           console.error("Couldn't connect to device!");
           process.exit(1);
         }
-        const device = getDevice(ebb.hardware);
-        await ebb.setPenHeight(device.penPctToPos(args.percent), 1000);
+        await dev.setPenHeight(args.percent, 1000);
 
         console.log(`moving to ${args.percent}%...`);
-        await ebb.close();
+        await dev.close();
       },
     )
     .command(
       "$0",
-      "run the Bit2AtomBot web server",
+      "run the Bit2AtomPlotGRBL web server",
       (args) =>
         args
           .option("port", {
@@ -284,7 +283,7 @@ export function cli(argv: string[]): void {
             default: "200mb",
           }),
       (args) => {
-        startServer(args.port, args.hardware, args.device, args["enable-cors"], args["max-payload-size"]);
+        startServer(args.port, args.device, args["enable-cors"], args["max-payload-size"], args.driver);
       },
     )
     .parse(argv);

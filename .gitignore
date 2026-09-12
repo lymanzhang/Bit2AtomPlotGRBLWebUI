@@ -11,6 +11,9 @@ svr_err.txt
 svr_out.txt
 z_out.txt
 *.log
+vitest-out.txt
+vitest-ws.txt
+testOutputs/
 
 # Temp scripts
 _finalfix.cjs

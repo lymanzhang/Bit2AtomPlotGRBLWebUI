@@ -118,7 +118,7 @@ export class PlotLogger {
     this.header(
       [
         "=".repeat(64),
-        "Bit2AtomBot 绘制任务日志",
+        "Bit2AtomPlotGRBL 绘制任务日志",
         "=".repeat(64),
         `源文件:        ${meta.fileName}`,
         `任务模式:      ${meta.mode}`,
