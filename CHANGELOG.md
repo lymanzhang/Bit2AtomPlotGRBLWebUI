@@ -7,6 +7,8 @@
 
 ## [0.1.0] - 2026-09-12
 
+> 发布：<https://github.com/lymanzhang/Bit2AtomPlotGRBLWebUI/releases/tag/v0.1.0>（附件 `bit2atomplotgrbl-0.1.0-src.zip`，包内含 RELEASE_NOTES.md）
+
 > 首个 GRBL 移植版发布。项目派生自姊妹项目 [Bit2AtomPlotWebUI](https://github.com/lymanzhang/Bit2AtomPlotWebUI)（EBB 版，v0.20.0 基线），面向 GRBL 固件体系笔式绘图仪（Z 轴步进电机抬笔）。移植过程与设计决策详见 [GRBL_PORT_PLAN.md](GRBL_PORT_PLAN.md)。
 
 ### Added（相对 EBB 基线的新增能力）

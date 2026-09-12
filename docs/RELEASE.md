@@ -71,11 +71,11 @@ Remove-Item Env:\GH_TOKEN
 
 ## 发布记录
 
-### v0.1.0（本地发布准备完成，待远端同步与 GitHub Release）
+### v0.1.0（已发布 2026-09-12）
 
+- 发布地址：<https://github.com/lymanzhang/Bit2AtomPlotGRBLWebUI/releases/tag/v0.1.0>，附件 `bit2atomplotgrbl-0.1.0-src.zip`（105 条目，正斜杠校验通过）
 - 首个 GRBL 移植版发布（EBB 版 v0.20.0 基线），版本历程见姊妹项目 Bit2AtomPlotWebUI 的发布记录
-- 已完成：package.json / CHANGELOG.md 版本号核对一致（0.1.0）；174 测试全绿、lint 零告警、typecheck 通过；发布提交（feat: complete GRBL port and release v0.1.0）；本地 tag `v0.1.0`；发布包 `_release/bit2atomplotgrbl-0.1.0/` 与 `bit2atomplotgrbl-0.1.0-src.zip`（.NET ZipArchive 打包，条目正斜杠已校验，内含 RELEASE_NOTES.md）
-- 待办：配置远端仓库（`git remote add origin <url>`）→ 推送 master 与 tag → 按「流程」一节创建 GitHub Release 并附 zip
+- 已完成：package.json / CHANGELOG.md 版本号核对一致（0.1.0）；174 测试全绿、lint 零告警、typecheck 通过；本地 tag `v0.1.0` 锚定发布提交；远端仓库（Public）创建、master + tag 推送、GitHub Release 创建（说明取自 RELEASE_NOTES.md）
 - 发布前核对清单：package.json 版本号、CHANGELOG.md 小节、tag、发布包三者一致；包内测试可独立运行（`npm ci` → `npm test`）
 
 ## 注意事项（各版本踩过的坑）
